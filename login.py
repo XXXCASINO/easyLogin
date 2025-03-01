@@ -1,1733 +1,838 @@
-####################################################################################################
-# FINAL_SETTLEMENT_SYSTEM.PY (최종 수정본 v7.3.9)
-# 작성일: 2025-02-27
-#
-# [변경 사항]
-# 1. 모든 텍스트 입력창은 5초 단위로 업데이트되며, 값이 없으면 "0"으로 표시됨.
-# 2. 자동 데이터는 빨간색, 수동 입력 시 흰색으로 표시됨.
-# 3. GUI는 2열 레이아웃으로 구성되어 왼쪽 열에는 B.C, 합계, 정산 결과
-#    (B.C는 config에 otp_xpath가 있을 경우에만 OTP 입력창/전송 버튼이 보임),
-#    오른쪽 열에는 VECT PAY, WING PAY, LEVEL 장, 개인장 출금, 개인장 잔액이 spacing 3으로 균일하게 배치됨.
-# 4. 수정/전송 버튼은 AnimatedButton 클래스로, 버튼 크기는 60×30, 테두리는 제거되며,
-#    수정 버튼 클릭 시 입력창의 텍스트 전체가 자동 선택되고, 완료 상태에서는 입력창이 읽기전용으로 전환되며
-#    애니메이션 효과와 함께 배경색이 변경되어 잠금 상태임을 표시함.
-# 5. OTP 입력창은 6자리 입력에 맞게 크기를 100×30으로, 전송 버튼은 60×30으로 설정되며,
-#    animate_otp()를 통해 2초 동안 서서히 나타남.
-# 6. WING PAY는 로그인 후 NASDAQ URL에서 5초마다 새로고침하며 xpath 정보를 취득함.
-# 7. VECT PAY는 네이버 로그인 URL로 접속 후 "아이디에요"/"비번이에요"를 입력, 로그인 버튼 클릭 후
-#    15초 대기 후 "https://www.winglobalpay.com/" URL로 이동하여, 로딩 후 2초, 2초, 3초, 3초, 3초씩 기다리며
-#    차례로 아래 xpath 요소들을 클릭/입력하여 최종 정보를 크롤링함.
-#       - /html/body/div[1]/div[1]/header/button[1]
-#       - /html/body/div[1]/div[2]/nav/ul/li[2]/a
-#       - /html/body/div[1]/div[2]/nav/ul/li[2]/ul/li[1]/a
-#       - /html/body/div[1]/div[6]/ul/li[5]/a
-#       - /html/body/div[1]/div[4]/div[3]/form/div/div[1]/input 에 "안녕 잘입력되고 있어 굿바이" 입력
-#       - /html/body/div[1]/div[4]/div[3]/div[4]/button[1] 클릭
-# 8. OTP 위젯은 기본적으로 숨김 처리되며, 해당 요소가 확인되면 animate_otp()를 통해 서서히 나타남.
-# 9. 정산 결과가 비정상일 경우, "증복입금 혹은 오승인 확인 요망." 또는 "입금 후 미신청 또는 핑돈 확인 요망." 문구가 표시되는데,
-#    후자의 경우 글자 크기를 15pt, 굵게 표시하고, 정산 시각도 동일한 크기와 굵은 글씨(파란색 유지)로 표시됨.
-#    정상인 경우 모든 텍스트가 초록색으로 표시됨.
-# 10. 메인 GUI 창은 400x300 크기로 최소화되어 있으며, 각 열 및 위젯 간 여백은 spacing 3으로 균일하게 배치됨.
-####################################################################################################
+import tkinter as tk
+from tkinter import ttk
+import threading, time, datetime, io
+from PIL import ImageGrab
 
-import sys, os, time, re, atexit, subprocess, functools
-from datetime import datetime
-
-from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QLineEdit, QPushButton, QLabel,
-    QMainWindow, QMessageBox, QHBoxLayout, QStackedWidget, QGroupBox, QGridLayout,
-    QGraphicsOpacityEffect, QFormLayout, QInputDialog
-)
-from PyQt5.QtCore import QRegExp, Qt, QTimer, QPropertyAnimation, pyqtSignal, QThread, QUrl, QVariantAnimation
-from PyQt5.QtGui import QGuiApplication, QDesktopServices, QRegExpValidator, QColor
-from PyQt5.QtWebEngineWidgets import QWebEngineView
-
+# Selenium 관련 모듈
 from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+# WebDriver Manager
+from webdriver_manager.chrome import ChromeDriverManager
+# explicit wait
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
-from webdriver_manager.chrome import ChromeDriverManager
 
-##############################################
-# AnimatedButton: 수정/전송 버튼 (호버 효과 및 스타일)
-##############################################
-class AnimatedButton(QPushButton):
-    def __init__(self, text=""):
-        super().__init__(text)
-        self.setStyleSheet("background-color: #2196F3; border: none; border-radius: 10px; font-size: 13pt; color: white;")
-        self.anim = QVariantAnimation(self)
-        self.anim.setDuration(500)
-        self.anim.valueChanged.connect(self.on_value_changed)
-    def on_value_changed(self, value):
-        base_color = QColor("#2196F3")
-        hover_color = QColor("#0D47A1")
-        r = base_color.red() + (hover_color.red() - base_color.red()) * value
-        g = base_color.green() + (hover_color.green() - base_color.green()) * value
-        b = base_color.blue() + (hover_color.blue() - base_color.blue()) * value
-        new_color = QColor(int(r), int(g), int(b))
-        self.setStyleSheet(f"background-color: {new_color.name()}; border: none; border-radius: 10px; font-size: 13pt; color: white;")
-    def enterEvent(self, event):
-        self.anim.stop()
-        self.anim.setStartValue(0.0)
-        self.anim.setEndValue(1.0)
-        self.anim.start()
-        super().enterEvent(event)
-    def leaveEvent(self, event):
-        self.anim.stop()
-        self.anim.setStartValue(1.0)
-        self.anim.setEndValue(0.0)
-        self.anim.start()
-        super().leaveEvent(event)
-
-##############################################
-# NumberLineEdit (자동 업데이트/수동 입력창)
-##############################################
-class NumberLineEdit(QLineEdit):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        # 폭을 200으로 늘려 100억까지 입력 가능하게 함.
-        self.setFixedWidth(200)
-        self.setValidator(QRegExpValidator(QRegExp("^[0-9]{0,11}$"), self))
-        self.textChanged.connect(self.formatText)
-    def formatText(self, text):
-        self.blockSignals(True)
-        digits = text.replace(",", "")
-        if digits == "":
-            self.blockSignals(False)
-            return
-        try:
-            num = int(digits)
-            formatted = f"{num:,}"
-            self.setText(formatted)
-        except Exception:
-            pass
-        self.blockSignals(False)
-
-##############################################
-# create_chrome_driver, non_headless_options
-##############################################
-def create_chrome_driver(options, retries=3):
-    for i in range(retries):
-        try:
-            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-            return driver
-        except Exception as e:
-            print(f"Chrome 드라이버 초기화 오류 (시도 {i+1}/{retries}): {e}")
-            time.sleep(2)
-    return None
-
-non_headless_options = webdriver.ChromeOptions()
-
-##############################################
-# 헬퍼 함수들
-##############################################
-class CopyableLineEdit(QLineEdit):
-    def mousePressEvent(self, event):
-        QGuiApplication.clipboard().setText(self.text())
-        super().mousePressEvent(event)
-
-class CopyableLabel(QLabel):
-    def mousePressEvent(self, event):
-        QGuiApplication.clipboard().setText(self.text())
-        super().mousePressEvent(event)
-
-def format_number(value):
-    if not value.strip():
-        return "0"
+def format_money(value):
     try:
-        num = float(value.replace(",", "").strip())
-        return f"{int(num):,}"
+        num = int(str(value).replace(',', ''))
+        return format(num, ',')
     except Exception:
         return value
 
-##############################################
-# 사이트별 크롤링 스레드
-##############################################
-class SiteAutomationThread(QThread):
-    automation_complete = pyqtSignal(str)
-    otp_ready = pyqtSignal(str)
-    otp_hide = pyqtSignal(str)
-    def __init__(self, config, parent=None):
-        super().__init__(parent)
-        self.config = config
-    def run(self):
-        if self.config['site_name'] == "VECT PAY":
-            try:
-                driver = create_chrome_driver(non_headless_options)
-                if not driver:
-                    self.automation_complete.emit("Driver Init Failed")
-                    return
-                driver.maximize_window()
-                driver.get(self.config['login_url'])
-                WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config['login_id_xpath'])))
-                time.sleep(15)
-                driver.find_element(By.XPATH, self.config['login_id_xpath']).clear()
-                driver.find_element(By.XPATH, self.config['login_id_xpath']).send_keys(self.config['login_id'])
-                driver.find_element(By.XPATH, self.config['login_pw_xpath']).clear()
-                driver.find_element(By.XPATH, self.config['login_pw_xpath']).send_keys(self.config['login_pw'])
-                driver.find_element(By.XPATH, self.config['login_button_xpath']).click()
-                time.sleep(15)
-                if self.config.get('otp_xpath', "").strip():
-                    try:
-                        otp_field = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config['otp_xpath'])))
-                        self.otp_ready.emit(self.config['site_name'])
-                        while self.config.get('otp_value', '') == '':
-                            time.sleep(0.5)
-                        otp_to_send = self.config.get('otp_value', '')
-                        if otp_to_send:
-                            otp_field.clear()
-                            otp_field.send_keys(otp_to_send + Keys.ENTER)
-                            self.config['otp_value'] = ''
-                            time.sleep(15)
-                    except Exception as e:
-                        print("B.C OTP 요소 미발견:", e)
-                time.sleep(3)
-                # VECT PAY의 경우, final_crawl_xpath에서 추출되는 원본 문자열에서
-                # 두 번째 등장하는 숫자부터 '-' 전까지의 숫자만 추출하고 천단위 콤마 포맷 적용
-                while True:
-                    time.sleep(3)
-                    driver.refresh()
-                    elem = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config['final_crawl_xpath'])))
-                    raw_text = elem.text
-                    matches = list(re.finditer(r'\d+', raw_text))
-                    if len(matches) >= 2:
-                        second_match = matches[1]
-                        remaining_text = raw_text[second_match.start():]
-                        dash_index = remaining_text.find(':')
-                        if dash_index != -1:
-                            number_str = remaining_text[:dash_index]
-                        else:
-                            number_str = remaining_text
-                        number_list = re.findall(r'\d+', number_str)
-                        if number_list:
-                            number_str = number_list[0]
-                        else:
-                            number_str = "0"
-                        formatted_number = f"{int(number_str):,}"
-                        text = formatted_number
-                    else:
-                        text = "0"
-                    self.automation_complete.emit(text)
-            except Exception as e:
-                print("VECT PAY 크롤링 오류:", e)
-                self.automation_complete.emit("Automation Error")
-            finally:
-                time.sleep(15)
-                driver.quit()
-            return
-
-        elif self.config['site_name'] == "B.C":
-            try:
-                driver = create_chrome_driver(non_headless_options)
-                if not driver:
-                    self.automation_complete.emit("Driver Init Failed")
-                    return
-                driver.maximize_window()
-                driver.get(self.config['login_url'])
-                WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config['login_id_xpath'])))
-                time.sleep(15)
-                driver.find_element(By.XPATH, self.config['login_id_xpath']).clear()
-                driver.find_element(By.XPATH, self.config['login_id_xpath']).send_keys(self.config['login_id'])
-                driver.find_element(By.XPATH, self.config['login_pw_xpath']).clear()
-                driver.find_element(By.XPATH, self.config['login_pw_xpath']).send_keys(self.config['login_pw'])
-                driver.find_element(By.XPATH, self.config['login_button_xpath']).click()
-                time.sleep(5)
-                if self.config.get('otp_xpath', "").strip():
-                    try:
-                        otp_field = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config['otp_xpath'])))
-                        self.otp_ready.emit(self.config['site_name'])
-                        while self.config.get('otp_value', '') == '':
-                            time.sleep(0.5)
-                        otp_to_send = self.config.get('otp_value', '')
-                        if otp_to_send:
-                            otp_field.clear()
-                            otp_field.send_keys(otp_to_send + Keys.ENTER)
-                            self.config['otp_value'] = ''
-                            time.sleep(5)
-                    except Exception as e:
-                        print("B.C OTP 요소 미발견:", e)
-                time.sleep(15)
-                # B.C는 로그인 후 post_login_url에서 최종 정보를 취득하도록 함.
-                driver.get(self.config['post_login_url'])
-                while True:
-                    time.sleep(5)
-                    driver.refresh()
-                    elem = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config['final_crawl_xpath'])))
-                    text = elem.text
-                    if '.' in text:
-                        text = text.split('.')[0]
-                    self.automation_complete.emit(text)
-            except Exception as e:
-                print("B.C 크롤링 오류:", e)
-                self.automation_complete.emit("Automation Error")
-            finally:
-                self.otp_hide.emit(self.config['site_name'])
-                time.sleep(5)
-                driver.quit()
-            return
-
-        elif self.config['site_name'] == "WING PAY":
-            try:
-                driver = create_chrome_driver(non_headless_options)
-                if not driver:
-                    self.automation_complete.emit("Driver Init Failed")
-                    return
-                driver.maximize_window()
-                driver.get(self.config['login_url'])
-                WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config['login_id_xpath'])))
-                time.sleep(20)
-                driver.find_element(By.XPATH, self.config['login_id_xpath']).clear()
-                driver.find_element(By.XPATH, self.config['login_id_xpath']).send_keys(self.config['login_id'])
-                driver.find_element(By.XPATH, self.config['login_pw_xpath']).clear()
-                driver.find_element(By.XPATH, self.config['login_pw_xpath']).send_keys(self.config['login_pw'])
-                driver.find_element(By.XPATH, self.config['login_button_xpath']).click()
-                time.sleep(15)
-                driver.get("https://m.stock.naver.com/worldstock/home/USA/marketValue/NASDAQ")
-                while True:
-                    time.sleep(15)
-                    driver.refresh()
-                    elem = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config['final_crawl_xpath'])))
-                    text = elem.text
-                    if '.' in text:
-                        text = text.split('.')[0]
-                    self.automation_complete.emit(text)
-            except Exception as e:
-                print("WING PAY 크롤링 오류:", e)
-                self.automation_complete.emit("Automation Error")
-            finally:
-                self.otp_hide.emit(self.config['site_name'])
-                time.sleep(15)
-                driver.quit()
-            return
-
-        try:
-            driver = create_chrome_driver(non_headless_options)
-            if not driver:
-                self.automation_complete.emit("Driver Init Failed")
-                return
-            driver.maximize_window()
-            while True:
-                self.perform_login(driver)
-                self.perform_post_login_actions(driver)
-                final_data = self.final_crawl(driver)
-                print(f"[{self.config['site_name']}] 최종 크롤링 데이터: {final_data}")
-                self.automation_complete.emit(final_data)
-                time.sleep(15)
-        except Exception as e:
-            print(f"SiteAutomationThread ({self.config['site_name']}) 오류:", e)
-            self.automation_complete.emit("Automation Error")
-        finally:
-            self.otp_hide.emit(self.config['site_name'])
-            driver.quit()
-
-    def perform_login(self, driver):
-        driver.get(self.config['login_url'])
-        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config['login_id_xpath'])))
-        time.sleep(15)
-        id_field = driver.find_element(By.XPATH, self.config['login_id_xpath'])
-        id_field.clear()
-        id_field.send_keys(self.config['login_id'])
-        pw_field = driver.find_element(By.XPATH, self.config['login_pw_xpath'])
-        pw_field.clear()
-        pw_field.send_keys(self.config['login_pw'])
-        driver.find_element(By.XPATH, self.config['login_button_xpath']).click()
-        time.sleep(15)
-
-    def handle_otp(self, driver):
-        if self.config.get('otp_xpath', "").strip():
-            WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config['otp_xpath'])))
-            self.otp_ready.emit(self.config['site_name'])
-            while self.config.get('otp_value', '') == '':
-                time.sleep(0.5)
-            otp_to_send = self.config.get('otp_value', '')
-            if otp_to_send:
-                otp_field = driver.find_element(By.XPATH, self.config['otp_xpath'])
-                otp_field.clear()
-                otp_field.send_keys(otp_to_send + Keys.ENTER)
-                self.config['otp_value'] = ''
-                time.sleep(15)
-        else:
-            pass
-
-    def perform_post_login_actions(self, driver):
-        driver.get(self.config['post_login_url'])
-        if 'post_login_actions' in self.config:
-            actions = self.config['post_login_actions']
-            for action in actions:
-                action_type = action.get('action')
-                xpath = action.get('xpath')
-                delay = action.get('delay', 1)
-                WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, xpath)))
-                if action_type == 'click':
-                    driver.find_element(By.XPATH, xpath).click()
-                elif action_type == 'input':
-                    input_value = action.get('value', '')
-                    elem = driver.find_element(By.XPATH, xpath)
-                    elem.clear()
-                    elem.send_keys(input_value)
-                time.sleep(delay)
-        else:
-            pass
-
-    def final_crawl(self, driver):
-        final_elem = driver.find_element(By.XPATH, self.config['final_crawl_xpath'])
-        return final_elem.text
-
-##############################################
-# 사이트 설정 (개별 분기 및 OTP 조건 추가)
-##############################################
-site_configs = {
-    "B.C": {
-        'login_url': 'https://www.accounts-bc.com/signin',
-        'login_id': 'juyeonglee911029@gmail.com',
-        'login_pw': '12Qwaszx!@',
-        'login_id_xpath': '/html/body/div[1]/ul/li[2]/div/ul/li[2]/div[1]/div/input',
-        'login_pw_xpath': '/html/body/div[1]/ul/li[2]/div/ul/li[2]/div[2]/div/div/input',
-        'login_button_xpath': '/html/body/div[1]/ul/li[2]/div/ul/li[3]/button',
-        'otp_xpath': '/html/body/div[1]/ul/li[2]/div/ul/li[2]/div/div[1]/div/input',
-        'post_login_url': 'https://scoutdata.feedconstruct.com/',
-        'click_xpath1': '', 'click_xpath2': '', 'click_xpath3': '',
-        'final_crawl_xpath': '/html/body/app-root/app-app/div/div[2]/app-game-section/div/div/div[2]/div/div[1]/div/div/mat-form-field/div[1]/div[2]/div[1]/input',
-        'otp_value': '',
-        'site_name': 'B.C'
-    },
-    "VECT PAY": {
-        'login_url': 'https://kba-europe.com/login/?redirect_to=https%3A%2F%2Fkba-europe.com',
-        'login_id': '아이디에요',
-        'login_pw': '비번이에요',
-        'login_id_xpath': '/html/body/div[1]/div/div[3]/div[1]/div/div/div[3]/div[2]/div/div/div/div/div/div/form/div/div[1]/div/div[1]/div[1]/input',
-        'login_pw_xpath': '/html/body/div[1]/div/div[3]/div[1]/div/div/div[3]/div[2]/div/div/div/div/div/div/form/div/div[1]/div/div[1]/div[2]/input',
-        'login_button_xpath': '/html/body/div[1]/div/div[3]/div[1]/div/div/div[3]/div[2]/div/div/div/div/div/div/form/div/div[1]/div/div[2]/button',
-        'otp_xpath': '/html/body/div[1]/div/div[3]/div[1]/div/div/div[3]/div[2]/div/div/div/div/div/div[2]/form/div/div[1]/div/div[1]/div[1]/input',
-        'post_login_url': 'https://www.winglobalpay.com/',
-        'click_xpath1': '/html/body/div[1]/div[1]/header/button[1]',
-        'click_xpath2': '/html/body/div[1]/div[2]/nav/ul/li[2]/a',
-        'click_xpath3': '/html/body/div[1]/div[2]/nav/ul/li[2]/ul/li[1]/a',
-        'final_crawl_xpath': '/html/body/div[1]/div/div[3]/div[2]/div/div/div/div/div/div/div[2]/ul/li[3]',  # 입력창에 "안녕 잘입력되고 있어 굿바이" 입력
-        'otp_value': '',
-        'site_name': 'VECT PAY'
-    },
-    "WING PAY": {
-        'login_url': 'https://nid.naver.com/nidlogin.login?mode=form&url=https://www.naver.com/',
-        'login_id': '아이디입니다',
-        'login_pw': '비밀번호입니다',
-        'login_id_xpath': '/html/body/div[1]/div[2]/div/div[1]/form/ul/li/div/div[1]/div/div[1]/input',
-        'login_pw_xpath': '/html/body/div[1]/div[2]/div/div[1]/form/ul/li/div/div[1]/div/div[2]/input',
-        'login_button_xpath': '/html/body/div[1]/div[2]/div/div[1]/form/ul/li/div/div[11]/button',
-        'otp_xpath': '', 
-        'post_login_url': '',
-        'click_xpath1': '', 'click_xpath2': '', 'click_xpath3': '',
-        'final_crawl_xpath': '/html/body/div[1]/div[1]/div[2]/div/div/div[4]/div[1]/div/div[1]/div/ul/li[1]/a/span',
-        'otp_value': '',
-        'site_name': 'WING PAY'
-    },
-    "개인장 출금": {
-        'login_url': 'https://www.pushbullet.com/1',
-        'login_id': 'your_gein_id',
-        'login_pw': 'your_gein_pw',
-        'login_id_xpath': 'XPath_GEIN_LOGIN_ID',
-        'login_pw_xpath': 'XPath_GEIN_LOGIN_PW',
-        'login_button_xpath': 'XPath_GEIN_LOGIN_BTN',
-        'otp_xpath': '', 
-        'post_login_url': 'https://www.pushbullet.com/1',
-        'click_xpath1': 'XPath_GEIN_CLICK1',
-        'click_xpath2': 'XPath_GEIN_CLICK2',
-        'click_xpath3': 'XPath_GEIN_CLICK3',
-        'final_crawl_xpath': 'XPath_GEIN_FINAL',
-        'otp_value': '',
-        'site_name': '개인장 출금'
-    },
-    "개인장 잔액": {
-        'login_url': 'https://www.pushbullet.com/1',
-        'login_id': 'your_gein_id',
-        'login_pw': 'your_gein_pw',
-        'login_id_xpath': 'XPath_GEIN_LOGIN_ID',
-        'login_pw_xpath': 'XPath_GEIN_LOGIN_PW',
-        'login_button_xpath': 'XPath_GEIN_LOGIN_BTN',
-        'otp_xpath': '', 
-        'post_login_url': 'https://www.pushbullet.com/1',
-        'click_xpath1': 'XPath_GEIN_CLICK1',
-        'click_xpath2': 'XPath_GEIN_CLICK2',
-        'click_xpath3': 'XPath_GEIN_CLICK3',
-        'final_crawl_xpath': 'XPath_GEIN_FINAL',
-        'otp_value': '',
-        'site_name': '개인장 잔액'
-    },
-    "LEVEL 장": {
-        'login_url': 'https://www.pushbullet.com/1',
-        'login_id': 'your_level_id',
-        'login_pw': 'your_level_pw',
-        'login_id_xpath': 'XPath_LEVEL_LOGIN_ID',
-        'login_pw_xpath': 'XPath_LEVEL_LOGIN_PW',
-        'login_button_xpath': 'XPath_LEVEL_LOGIN_BTN',
-        'otp_xpath': '',
-        'post_login_url': 'https://www.netflix.com/dashboard',
-        'click_xpath1': 'XPath_LEVEL_CLICK1',
-        'click_xpath2': 'XPath_LEVEL_CLICK2',
-        'click_xpath3': 'XPath_LEVEL_CLICK3',
-        'final_crawl_xpath': 'XPath_LEVEL_FINAL',
-        'otp_value': '',
-        'site_name': 'LEVEL 장'
-    }
-}
-
-##############################################
-# Login 화면
-##############################################
-class LoginWidget(QWidget):
-    login_success = pyqtSignal(str)
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setup_ui()
-    def setup_ui(self):
-        self.setMinimumSize(300,150)
-        main_layout = QVBoxLayout(self)
-        main_layout.setAlignment(Qt.AlignCenter)
-        form_group = QGroupBox("")
-        form_group.setStyleSheet("background-color: #FFFFFF; color: #333333; border: none;")
-        form_layout = QFormLayout()
-        form_layout.setSpacing(10)
-        self.username_edit = QLineEdit()
-        self.username_edit.setPlaceholderText("아이디")
-        self.username_edit.setFixedHeight(30)
-        self.username_edit.setText("EXTA")
-        self.username_edit.setStyleSheet("font-size: 10pt; color: #333333; background-color: #D3D3D3; border: none;")
-        self.username_edit.setFixedWidth(120)
-        self.password_edit = QLineEdit()
-        self.password_edit.setPlaceholderText("비밀번호")
-        self.password_edit.setEchoMode(QLineEdit.Password)
-        self.password_edit.setFixedHeight(30)
-        self.password_edit.setText("papa")
-        self.password_edit.setStyleSheet("font-size: 10pt; color: #333333; background-color: #D3D3D3; border: none;")
-        self.password_edit.setFixedWidth(120)
-        form_layout.addRow("ID :", self.username_edit)
-        form_layout.addRow("Password :", self.password_edit)
-        form_group.setLayout(form_layout)
-        main_layout.addWidget(form_group, alignment=Qt.AlignCenter)
-        # 수정: 로그인 버튼을 AnimatedButton으로 교체하여 호버 효과 적용
-        self.login_button = AnimatedButton("로그인")
-        self.login_button.clicked.connect(self.handle_login)
-        self.login_button.setFixedHeight(30)
-        self.login_button.setFixedWidth(120)
-        main_layout.addWidget(self.login_button, alignment=Qt.AlignCenter)
-        self.success_label = QLabel("로그인 성공")
-        self.success_label.setAlignment(Qt.AlignCenter)
-        self.success_label.setStyleSheet("color: green; font-size: 12pt;")
-        self.success_label.setVisible(False)
-        self.success_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        main_layout.addWidget(self.success_label, alignment=Qt.AlignCenter)
-    def handle_login(self):
-        if self.username_edit.text().strip() == "EXTA" and self.password_edit.text().strip() == "papa":
-            self.show_success_message()
-        else:
-            QMessageBox.warning(self, "오류", "아이디 또는 비밀번호가 올바르지 않습니다.")
-    def show_success_message(self):
-        self.success_label.setVisible(True)
-        self.success_label.setGraphicsEffect(None)
-        QTimer.singleShot(2000, self.fade_out_success_message)
-    def fade_out_success_message(self):
-        effect = QGraphicsOpacityEffect(self.success_label)
-        self.success_label.setGraphicsEffect(effect)
-        self.anim = QPropertyAnimation(effect, b"opacity")
-        self.anim.setDuration(1000)
-        self.anim.setStartValue(1)
-        self.anim.setEndValue(0)
-        self.anim.finished.connect(self.on_fade_finished)
-        self.anim.start()
-    def on_fade_finished(self):
-        self.login_success.emit("EXTA")
-
-##############################################
-# 메인 인터페이스 (2열 레이아웃 적용)
-##############################################
-class MainInterfaceWidget(QWidget):
-    def __init__(self, login_id, parent=None):
-        super().__init__(parent)
-        self.login_id = login_id
-        self.last_success_time = ""
-        self.automation_on_time = None
-        self.modify_buttons = {}
-        self.fetch_edits = {}
-        self.otp_inputs = {}   # OTP 위젯은 기본적으로 숨김 처리
-        self.send_buttons = {}
-        self.error_msg_labels = {}
-        self.error_status = {}
-        self.bottom_info = QLabel("")
-        self.last_success_label = QLabel("")
-        # 정산 시각(최종 정상 시각)을 15pt, 굵게, 파란색으로 표시
-        self.last_success_label.setStyleSheet("font-size: 15pt; color: blue; font-weight: bold;")
-        self.result_msg_label = QLabel("")
-        self.result_msg_label.setVisible(False)
-        self.configs = site_configs
-        self.setup_ui()
-        self.start_timer()
-        QTimer.singleShot(5000, self.start_site_automation_all)
-    def setup_ui(self):
-        main_layout = QVBoxLayout(self)
-        main_layout.setSpacing(10)
-        main_layout.setContentsMargins(5,5,5,5)
-        title = QLabel("자동 정산 시스템")
-        title.setStyleSheet("font-size: 13pt; color: #0066CC; border: none;")
-        title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        hbox = QHBoxLayout()
-        # 왼쪽 열: B.C, 합계, 정산 결과
-        left_vbox = QVBoxLayout()
-        left_grid = QGridLayout()
-        left_grid.setSpacing(3)
-        left_grid.addWidget(QLabel("B.C"), 0, 0)
-        # 수정: 더블클릭으로 수정되지 않도록 NumberLineEdit 사용
-        field_bc = NumberLineEdit()
-        field_bc.setReadOnly(True)
-        field_bc.setPlaceholderText("자동 업데이트 / 수동 입력")
-        field_bc.setAlignment(Qt.AlignCenter)
-        field_bc.setStyleSheet("font-size: 11pt; color: white; background-color: black; border: none;")
-        left_grid.addWidget(field_bc, 0, 1)
-        self.fetch_edits["B.C"] = field_bc
-        btn_bc = AnimatedButton("수정")
-        btn_bc.setFixedSize(60,30)
-        btn_bc.clicked.connect(lambda checked, s="B.C": self.modify_auto_update(s))
-        left_grid.addWidget(btn_bc, 0, 2)
-        self.modify_buttons["B.C"] = btn_bc
-        err_bc = QLabel("")
-        err_bc.setFixedWidth(100)
-        err_bc.setStyleSheet("color: orange; font-size: 10pt;")
-        err_bc.setVisible(False)
-        left_grid.addWidget(err_bc, 0, 3)
-        self.error_msg_labels["B.C"] = err_bc
-        if self.configs["B.C"].get("otp_xpath", "").strip():
-            otp_bc = QLineEdit()
-            otp_bc.setMaxLength(6)
-            otp_bc.setPlaceholderText("OTP 입력")
-            otp_bc.setAlignment(Qt.AlignCenter)
-            otp_bc.setStyleSheet("font-size: 11pt; color: white; background-color: black; border: none;")
-            otp_bc.setFixedSize(100,30)
-            otp_bc.setVisible(False)
-            left_grid.addWidget(otp_bc, 0, 4)
-            self.otp_inputs["B.C"] = otp_bc
-            send_bc = AnimatedButton("전송")
-            send_bc.setFixedSize(60,30)
-            send_bc.setStyleSheet("background-color: transparent; border: none; font-size: 13pt; color: #0066CC;")
-            send_bc.setVisible(False)
-            send_bc.clicked.connect(lambda checked, s="B.C": self.send_otp(s))
-            left_grid.addWidget(send_bc, 0, 5)
-            self.send_buttons["B.C"] = send_bc
-        left_grid.addWidget(QLabel("합계"), 1, 0)
-        sum_field = NumberLineEdit()
-        sum_field.setReadOnly(True)
-        sum_field.setText("0")
-        sum_field.setAlignment(Qt.AlignCenter)
-        sum_field.setStyleSheet("font-size: 11pt; color: white; background-color: black; border: none;")
-        left_grid.addWidget(sum_field, 1, 1)
-        self.sum_edit = sum_field
-        left_grid.addWidget(QLabel("정산 결과"), 2, 0)
-        settlement_field = NumberLineEdit()
-        settlement_field.setReadOnly(True)
-        settlement_field.setText("0")
-        settlement_field.setAlignment(Qt.AlignCenter)
-        settlement_field.setStyleSheet("font-size: 11pt; color: white; background-color: black; border: none;")
-        left_grid.addWidget(settlement_field, 2, 1)
-        self.settlement_edit = settlement_field
-        left_grid.addWidget(self.result_msg_label, 3, 0, 1, 3)
-        left_grid.addWidget(self.last_success_label, 4, 0, 1, 3)
-        left_vbox.addLayout(left_grid)
-        hbox.addLayout(left_vbox)
-        # 오른쪽 열: VECT PAY, WING PAY, LEVEL 장, 개인장 출금, 개인장 잔액
-        right_vbox = QVBoxLayout()
-        right_grid = QGridLayout()
-        right_grid.setSpacing(3)
-        sites_right = ["VECT PAY", "WING PAY", "LEVEL 장", "개인장 출금", "개인장 잔액"]
-        row = 0
-        for site in sites_right:
-            right_grid.addWidget(QLabel(site), row, 0)
-            # 수정: NumberLineEdit로 생성하여 더블클릭 편집 방지
-            field = NumberLineEdit()
-            field.setReadOnly(True)
-            field.setPlaceholderText("자동 업데이트 / 수동 입력")
-            field.setAlignment(Qt.AlignCenter)
-            field.setStyleSheet("font-size: 11pt; color: white; background-color: black; border: none;")
-            right_grid.addWidget(field, row, 1)
-            self.fetch_edits[site] = field
-            btn = AnimatedButton("수정")
-            btn.setFixedSize(60,30)
-            btn.clicked.connect(lambda checked, s=site: self.modify_auto_update(s))
-            right_grid.addWidget(btn, row, 2)
-            self.modify_buttons[site] = btn
-            if self.configs[site].get("otp_xpath", "").strip():
-                otp_in = QLineEdit()
-                otp_in.setMaxLength(6)
-                otp_in.setPlaceholderText("OTP 입력")
-                otp_in.setAlignment(Qt.AlignCenter)
-                otp_in.setStyleSheet("font-size: 11pt; color: white; background-color: black; border: none;")
-                otp_in.setFixedSize(100,30)
-                otp_in.setVisible(False)
-                right_grid.addWidget(otp_in, row, 3)
-                self.otp_inputs[site] = otp_in
-                send_btn = AnimatedButton("전송")
-                send_btn.setFixedSize(60,30)
-                send_btn.setStyleSheet("background-color: transparent; border: none; font-size: 13pt; color: #0066CC;")
-                send_btn.setVisible(False)
-                send_btn.clicked.connect(lambda checked, s=site: self.send_otp(s))
-                right_grid.addWidget(send_btn, row, 4)
-                self.send_buttons[site] = send_btn
-            row += 1
-        right_vbox.addLayout(right_grid)
-        hbox.addLayout(right_vbox)
-        main_layout.addLayout(hbox)
-        bottom_layout = QHBoxLayout()
-        bottom_layout.addStretch()
-        self.bottom_info = QLabel(f"사용자: {self.login_id}    {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
-        self.bottom_info.setStyleSheet("font-size: 12pt; color: #333333;")
-        bottom_layout.addWidget(self.bottom_info)
-        bottom_layout.addStretch()
-        main_layout.addLayout(bottom_layout)
-        self.setLayout(main_layout)
-    def modify_auto_update(self, site):
-        field = self.fetch_edits.get(site)
-        btn = self.modify_buttons.get(site)
-        if field is None or btn is None:
-            return
-        if field.isReadOnly():
-            # 수정 버튼 클릭 -> 편집 가능 상태로 전환
-            field.setReadOnly(False)
-            field.selectAll()  # 전체 텍스트 자동 선택
-            btn.setText("완료")
-            btn.setStyleSheet("background-color: transparent; border: none; font-size: 13pt; color: #00FF00;")
-        else:
-            # 완료 버튼 클릭 -> 편집 불가 상태로 전환하며 애니메이션 및 배경색 변경
-            field.setReadOnly(True)
-            effect = QGraphicsOpacityEffect(field)
-            field.setGraphicsEffect(effect)
-            anim = QPropertyAnimation(effect, b"opacity")
-            anim.setDuration(500)
-            anim.setStartValue(1)
-            anim.setEndValue(0.7)
-            anim.start()
-            field.setStyleSheet("font-size: 11pt; color: white; background-color: grey; border: none;")
-            btn.setText("수정")
-            btn.setStyleSheet("background-color: transparent; border: none; font-size: 13pt; color: #0066CC;")
-            self.calculate_settlement()
-    def modify_personal_balance(self):
-        field = self.fetch_edits.get("개인장 잔액")
-        btn = self.modify_buttons.get("개인장 잔액")
-        if field is None or btn is None:
-            return
-        if field.isReadOnly():
-            field.setReadOnly(False)
-            field.selectAll()
-            btn.setText("완료")
-            btn.setStyleSheet("background-color: transparent; border: none; font-size: 13pt; color: #00FF00;")
-        else:
-            field.setReadOnly(True)
-            btn.setText("수정")
-            btn.setStyleSheet("background-color: transparent; border: none; font-size: 13pt; color: #0066CC;")
-    def send_otp(self, site):
-        otp_val = self.otp_inputs[site].text() if self.otp_inputs.get(site) else ""
-        self.configs[site]['otp_value'] = otp_val
-        print(f"{site} OTP 전송: {otp_val}")
-        if self.otp_inputs.get(site):
-            self.otp_inputs[site].clear()
-        self.hide_otp(site)
-    def calculate_settlement(self):
-        try:
-            bc_val = float(re.sub(r"[^\d\.]", "", self.fetch_edits.get("B.C").text()))
-        except:
-            bc_val = 0.0
-        total_other = 0.0
-        for site in ["VECT PAY", "WING PAY", "LEVEL 장", "개인장 출금", "개인장 잔액"]:
-            try:
-                val = float(re.sub(r"[^\d\.]", "", self.fetch_edits.get(site).text()))
-            except:
-                val = 0.0
-            total_other += val
-        self.sum_edit.setText(format_number(str(total_other)))
-        diff = bc_val - total_other
-        if diff == 0:
-            # 정상일 경우 모든 글씨 초록색, 정산 시각은 15pt, 굵게, 파란색 유지
-            self.settlement_edit.setText(f"{format_number(str(diff))} (정상)")
-            self.settlement_edit.setStyleSheet("font-size: 15pt; color: green; background-color: black; border: none;")
-            self.result_msg_label.setText("")
-            self.last_success_label.setText(f"최종 정상 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            self.last_success_label.setStyleSheet("font-size: 15pt; color: blue; font-weight: bold;")
-        else:
-            self.settlement_edit.setText(f"{format_number(str(diff))} (비정상)")
-            self.settlement_edit.setStyleSheet("font-size: 11pt; color: red; background-color: black; border: none;")
-            msg = "증복입금 혹은 오승인 확인 요망." if bc_val > total_other else "입금 후 미신청 또는 핑돈 확인 요망."
-            if msg == "입금 후 미신청 또는 핑돈 확인 요망.":
-                self.result_msg_label.setStyleSheet("font-size: 15pt; color: red; font-weight: bold;")
-            else:
-                self.result_msg_label.setStyleSheet("font-size: 15pt; color: red;")
-            self.result_msg_label.setText(msg)
-            self.result_msg_label.setVisible(True)
-    def update_error_label(self, site, error_text):
-        if site in self.error_msg_labels:
-            lbl = self.error_msg_labels[site]
-            lbl.setText("X")
-            lbl.setVisible(True)
-            QTimer.singleShot(2000, lambda: lbl.setVisible(False))
-    def start_timer(self):
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_time)
-        self.timer.start(1000)
-        self.update_time()
-    def update_time(self):
-        current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        self.bottom_info.setText(f"사용자: {self.login_id}    {current_time}")
-    def start_site_automation_all(self):
-        self.configs = site_configs
-        self.error_status = {site: False for site in self.configs.keys()}
-        self.site_auto_threads = []
-        for config in self.configs.values():
-            thread = SiteAutomationThread(config)
-            thread.automation_complete.connect(functools.partial(self.update_site_field, config['site_name']))
-            thread.otp_ready.connect(functools.partial(self.animate_otp, config['site_name']))
-            thread.otp_hide.connect(functools.partial(self.hide_otp, config['site_name']))
-            thread.start()
-            self.site_auto_threads.append(thread)
-    def update_site_field(self, site, value):
-        field = self.fetch_edits.get(site)
-        if value == "Automation Error":
-            self.update_error_label(site, "Automation Error")
-        else:
-            if not value.strip():
-                value = "0"
-            if field.isReadOnly():
-                field.setText(format_number(value))
-                field.setStyleSheet("font-size: 11pt; color: red; background-color: black; border: none;")
-        self.calculate_settlement()
-    def animate_otp(self, site):
-        if site in self.configs and self.configs[site].get("otp_xpath", "").strip():
-            if site in self.otp_inputs and self.otp_inputs[site] is not None:
-                anim = QPropertyAnimation(self.otp_inputs[site], b"windowOpacity")
-                anim.setDuration(2000)
-                anim.setStartValue(0)
-                anim.setEndValue(1)
-                anim.start()
-                self.otp_inputs[site].setVisible(True)
-                anim2 = QPropertyAnimation(self.send_buttons[site], b"windowOpacity")
-                anim2.setDuration(2000)
-                anim2.setStartValue(0)
-                anim2.setEndValue(1)
-                anim2.start()
-                self.send_buttons[site].setVisible(True)
-            else:
-                otp_in = QLineEdit()
-                otp_in.setMaxLength(6)
-                otp_in.setPlaceholderText("OTP 입력")
-                otp_in.setAlignment(Qt.AlignCenter)
-                otp_in.setStyleSheet("font-size: 11pt; color: white; background-color: black; border: none;")
-                otp_in.setFixedSize(100,30)
-                self.otp_inputs[site] = otp_in
-                send_btn = AnimatedButton("전송")
-                send_btn.setFixedSize(60,30)
-                send_btn.clicked.connect(lambda checked, s=site: self.send_otp(s))
-                self.send_buttons[site] = send_btn
-                otp_in.setVisible(True)
-                send_btn.setVisible(True)
-    def hide_otp(self, site):
-        if site in self.otp_inputs and self.otp_inputs[site] is not None:
-            self.otp_inputs[site].setVisible(False)
-        if site in self.send_buttons and self.send_buttons[site] is not None:
-            self.send_buttons[site].setVisible(False)
-    def open_excel_file(self):
-        pass
-
-##############################################
-# MainWindow
-##############################################
-class MainWindow(QMainWindow):
+class SettlementCrawlerApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("실시간 정산 시스템")
-        self.resize(200,200)
-        self.stacked_widget = QStackedWidget()
-        self.setCentralWidget(self.stacked_widget)
-        self.login_widget = LoginWidget()
-        self.login_widget.login_success.connect(self.on_login_success)
-        self.stacked_widget.addWidget(self.login_widget)
-    def on_login_success(self, login_id):
-        print("로그인 성공:", login_id)
-        self.main_interface = MainInterfaceWidget(login_id)
-        self.stacked_widget.addWidget(self.main_interface)
-        self.stacked_widget.setCurrentWidget(self.main_interface)
-        print("메인 인터페이스로 전환됨")
-    def closeEvent(self, event):
+        self.title("실시간 정산 크롤링 프로그램")
+        self.geometry("980x577")
+        self.resizable(False, False)
+        self.configure(bg="#2E2E2E")
+        self.style = ModernStyle(self)
+        
+        self.custom_font = ("Segoe UI", 12)
+        self.entry_bg = "#424242"
+        self.manual_fg = "#FFFFFF"
+        self.crawling_fg = "red"
+        self.btn_width = 8
+        
+        self.crawling_control = {}
+        self.start_buttons = {}
+        
+        # ─── 입금 정산 섹션 ───
+        self.deposit_section = tk.LabelFrame(self, text="입금 정산", font=("Segoe UI", 14),
+                                             fg="red", bg="#2E2E2E", bd=2, relief="groove")
+        self.deposit_section.grid(row=0, column=0, sticky="ew", padx=10, pady=5)
+        self.deposit_left_frame = ttk.Frame(self.deposit_section)
+        self.deposit_left_frame.grid(row=0, column=0, padx=10, pady=5, sticky="nsew")
+        self.deposit_right_frame = ttk.Frame(self.deposit_section)
+        self.deposit_right_frame.grid(row=0, column=1, padx=10, pady=5, sticky="nsew")
+        self.deposit_left_frame.grid_columnconfigure(0, minsize=120)
+        self.deposit_right_frame.grid_columnconfigure(0, minsize=120)
+        
+        deposit_left_names = ["B.C", "합계", "정산 결과", "입금 후 미신청", "증복 승인", "전일 금액"]
+        self.left_fields = {}
+        self.left_entries = {}
+        self.deposit_editable = {}
+        for r, name in enumerate(deposit_left_names):
+            lbl = ttk.Label(self.deposit_left_frame, text=name)
+            lbl.grid(row=r, column=0, padx=5, pady=5, sticky="w")
+            var = tk.StringVar()
+            ent = tk.Entry(self.deposit_left_frame, textvariable=var, font=self.custom_font,
+                           justify="right", relief="flat", bg=self.entry_bg, fg=self.manual_fg)
+            ent.grid(row=r, column=1, padx=5, pady=5, sticky="e")
+            self.left_fields[name] = var
+            self.left_entries[name] = ent
+            if name in ["합계", "정산 결과"]:
+                ent.bind("<KeyPress>", lambda event, n=name: "break")
+            else:
+                if name == "B.C":
+                    self.deposit_editable[name] = False
+                    start_btn = ttk.Button(self.deposit_left_frame, text="시작", width=self.btn_width,
+                                             style="Start.TButton",
+                                             command=lambda n=name, s="left": self.toggle_crawling(n, s))
+                    start_btn.grid(row=r, column=3, padx=5)
+                    self.start_buttons[(name, "left")] = start_btn
+                    mod_btn = ttk.Button(self.deposit_left_frame, text="수정", width=self.btn_width,
+                                           command=lambda n=name: self.toggle_edit_deposit(n, "left"))
+                    mod_btn.grid(row=r, column=2, padx=5)
+                    ent.bind("<KeyPress>", lambda event, n=name: self.on_key_press_deposit(event, n))
+                    ent.bind("<KeyRelease>", lambda event, n=name: self.on_numeric_key_release_deposit(event, n))
+                elif name == "전일 금액":
+                    self.deposit_editable[name] = False
+                    mod_btn = ttk.Button(self.deposit_left_frame, text="수정", width=self.btn_width,
+                                           command=lambda n=name: self.toggle_edit_deposit(n, "left"))
+                    mod_btn.grid(row=r, column=2, padx=5)
+                    ent.bind("<KeyPress>", lambda event, n=name: self.on_key_press_deposit(event, n))
+                    ent.bind("<KeyRelease>", lambda event, n=name: self.on_numeric_key_release_deposit(event, n))
+                else:
+                    ent.bind("<KeyRelease>", lambda event, n=name: self.on_numeric_key_release_deposit(event, n))
+        
+        self.right_fields = {}
+        self.right_entries = {}
+        self.deposit_right_editable = {}
+        for r, name in enumerate(["VECT PAY", "WING PAY", "GOLD PAY 잔액", "GOLD PAY 출금", "LVL 장"]):
+            lbl = ttk.Label(self.deposit_right_frame, text=name)
+            lbl.grid(row=r, column=0, padx=5, pady=5, sticky="w")
+            var = tk.StringVar()
+            ent = tk.Entry(self.deposit_right_frame, textvariable=var, font=self.custom_font,
+                           justify="right", relief="flat", bg=self.entry_bg, fg=self.manual_fg)
+            ent.grid(row=r, column=1, padx=5, pady=5, sticky="e")
+            self.right_fields[name] = var
+            self.right_entries[name] = ent
+            self.deposit_right_editable[name] = False
+            mod_btn = ttk.Button(self.deposit_right_frame, text="수정", width=self.btn_width,
+                                  command=lambda n=name: self.toggle_edit_deposit_right(n))
+            mod_btn.grid(row=r, column=2, padx=5)
+            start_btn = ttk.Button(self.deposit_right_frame, text="시작", width=self.btn_width,
+                                     style="Start.TButton",
+                                     command=lambda n=name, s="right": self.toggle_crawling(n, s))
+            start_btn.grid(row=r, column=3, padx=5)
+            self.start_buttons[(name, "right")] = start_btn
+            ent.bind("<KeyPress>", lambda event, n=name: self.on_key_press_deposit_right(event, n))
+            ent.bind("<KeyRelease>", lambda event, n=name: self.on_numeric_key_release_deposit_right(event, n))
+        
+        self.deposit_settlement_label = ttk.Label(self.deposit_section, text="", font=("Segoe UI", 11), foreground="lime")
+        self.deposit_settlement_label.grid(row=1, column=0, columnspan=2, pady=5)
+        
+        self.withdraw_section = tk.LabelFrame(self, text="출금 정산", font=("Segoe UI", 14),
+                                              fg="red", bg="#2E2E2E", bd=2, relief="groove")
+        self.withdraw_section.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
+        self.withdraw_left_frame = ttk.Frame(self.withdraw_section)
+        self.withdraw_left_frame.grid(row=0, column=0, padx=10, pady=5, sticky="nsew")
+        self.withdraw_right_frame = ttk.Frame(self.withdraw_section)
+        self.withdraw_right_frame.grid(row=0, column=1, padx=10, pady=5, sticky="nsew")
+        self.withdraw_left_frame.grid_columnconfigure(0, minsize=120)
+        self.withdraw_right_frame.grid_columnconfigure(0, minsize=120)
+        
+        withdraw_left_names = ["B.C 출금", "출금 합계", "정산 결과"]
+        self.withdraw_left_fields = {}
+        self.withdraw_left_entries = {}
+        self.withdraw_left_editable = {}
+        for r, name in enumerate(withdraw_left_names):
+            lbl = ttk.Label(self.withdraw_left_frame, text=name)
+            lbl.grid(row=r, column=0, padx=5, pady=5, sticky="w")
+            var = tk.StringVar()
+            ent = tk.Entry(self.withdraw_left_frame, textvariable=var, font=self.custom_font,
+                           justify="right", relief="flat", bg=self.entry_bg, fg=self.manual_fg)
+            ent.grid(row=r, column=1, padx=5, pady=5, sticky="e")
+            self.withdraw_left_fields[name] = var
+            self.withdraw_left_entries[name] = ent
+            if name in ["출금 합계", "정산 결과"]:
+                ent.bind("<KeyPress>", lambda event, n=name: "break")
+            else:
+                self.withdraw_left_editable[name] = False
+                mod_btn = ttk.Button(self.withdraw_left_frame, text="수정", width=self.btn_width,
+                                     command=lambda n=name: self.toggle_edit_withdraw_left(n))
+                mod_btn.grid(row=r, column=2, padx=5)
+                start_btn = ttk.Button(self.withdraw_left_frame, text="시작", width=self.btn_width,
+                                       style="Start.TButton",
+                                       command=lambda n=name, s="withdraw_left": self.toggle_crawling(n, s))
+                start_btn.grid(row=r, column=3, padx=5)
+                self.start_buttons[(name, "withdraw_left")] = start_btn
+                ent.bind("<KeyPress>", lambda event, n=name: self.on_key_press_withdraw_left(event, n))
+                ent.bind("<KeyRelease>", lambda event, n=name: self.on_numeric_key_release_withdraw_left(event, n))
+        
+        withdraw_right_names = ["환정장 출금", "VECT PAY 출금", "뒷장", "일일 한도", "잔여 한도"]
+        self.withdraw_right_fields = {}
+        self.withdraw_right_entries = {}
+        self.withdraw_editable = {}
+        for r, name in enumerate(withdraw_right_names):
+            lbl = ttk.Label(self.withdraw_right_frame, text=name)
+            lbl.grid(row=r, column=0, padx=5, pady=5, sticky="w")
+            var = tk.StringVar()
+            ent = tk.Entry(self.withdraw_right_frame, textvariable=var, font=self.custom_font,
+                           justify="right", relief="flat", bg=self.entry_bg, fg=self.manual_fg, width=15)
+            ent.grid(row=r, column=1, padx=5, pady=5, sticky="e")
+            self.withdraw_right_fields[name] = var
+            self.withdraw_right_entries[name] = ent
+            if name == "VECT PAY 출금":
+                self.withdraw_editable[name] = False
+                mod_btn = ttk.Button(self.withdraw_right_frame, text="수정", width=self.btn_width,
+                                     command=lambda n=name: self.toggle_edit_withdraw(n))
+                mod_btn.grid(row=r, column=2, padx=5)
+                start_btn = ttk.Button(self.withdraw_right_frame, text="시작", width=self.btn_width,
+                                         style="Start.TButton",
+                                         command=lambda n=name, s="right": self.toggle_crawling(n, s))
+                start_btn.grid(row=r, column=3, padx=5)
+                self.start_buttons[(name, "right")] = start_btn
+                ent.bind("<KeyPress>", lambda event, n=name: self.on_key_press_withdrawal(event, n))
+                ent.bind("<KeyRelease>", lambda event, n=name: self.on_numeric_key_release_withdrawal(event, n))
+            elif name in ("일일 한도", "잔여 한도"):
+                ent.bind("<KeyPress>", lambda event, n=name: self.on_key_press_withdrawal(event, n))
+                ent.bind("<KeyRelease>", lambda event, n=name: self.on_numeric_key_release_withdrawal_auto(event, n))
+            else:
+                self.withdraw_editable[name] = False
+                mod_btn = ttk.Button(self.withdraw_right_frame, text="수정", width=self.btn_width,
+                                     command=lambda n=name: self.toggle_edit_withdraw(n))
+                mod_btn.grid(row=r, column=2, padx=5)
+                ent.bind("<KeyPress>", lambda event, n=name: self.on_key_press_withdrawal(event, n))
+                ent.bind("<KeyRelease>", lambda event, n=name: self.on_numeric_key_release_withdrawal(event, n))
+        
+        self.withdraw_settlement_label = ttk.Label(self.withdraw_section, text="", font=("Segoe UI", 11), foreground="lime")
+        self.withdraw_settlement_label.grid(row=1, column=0, columnspan=2, pady=5)
+        
+        self.screenshot_button = ttk.Button(self, text="스크린샷", width=self.btn_width, command=self.copy_screenshot)
+        self.copy_text_button = ttk.Button(self, text="정보 취출", width=self.btn_width, command=self.copy_text_info)
+        self.screenshot_button.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-10)
+        self.copy_text_button.place(relx=1.0, rely=1.0, anchor="se", x=-110, y=-10)
+        
+        self.scoutdata_label = ttk.Label(self, text="", style="TLabel")
+        self.scoutdata_label.place(relx=0.5, rely=0.95, anchor="center")
+        
+        self.status_label = ttk.Label(self, text="", style="TLabel")
+        self.status_label.grid(row=2, column=0, columnspan=2, pady=5)
+        self.update_clock()
+    
+    # OTP 폴링 함수 (별도 쓰레드에서 4초마다 체크)
+    def otp_polling(self, driver, stop_event, xpath="OTP_ELEMENT_XPATH"):
+        while not stop_event.is_set():
+            try:
+                element = driver.find_element(By.XPATH, xpath)
+                if element and element.is_displayed():
+                    self.after(0, self.show_otp_input, driver, element)
+                    time.sleep(4)  # OTP 입력창이 뜨면 4초 대기 후 다시 체크
+                else:
+                    time.sleep(4)
+            except Exception:
+                time.sleep(4)
+    
+    def start_otp_polling(self, driver, stop_event, xpath="OTP_ELEMENT_XPATH"):
+        threading.Thread(target=self.otp_polling, args=(driver, stop_event, xpath), daemon=True).start()
+    
+    def toggle_crawling(self, field_name, side):
+        key = (field_name, side)
+        if key in self.crawling_control:
+            self.crawling_control[key]["stop_event"].set()
+            self.start_buttons[key].config(text="시작", style="Start.TButton")
+        else:
+            stop_event = threading.Event()
+            t = threading.Thread(target=self.run_field_crawling, args=(field_name, side, stop_event), daemon=True)
+            self.crawling_control[key] = {"thread": t, "stop_event": stop_event}
+            t.start()
+            self.start_buttons[key].config(text="정지", style="Stop.TButton")
+    
+    def run_field_crawling(self, field_name, side, stop_event):
+        # 19초 주기: refresh 후 18초 대기, 값 추출 후 1초 대기
+        if field_name == "B.C" and side == "left":
+            options = Options()
+            options.headless = False
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            try:
+                driver.get("https://www.accounts-bc.com/signin")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.find_element(By.XPATH, "/html/body/div[1]/ul/li[2]/div/ul/li[2]/div[1]/div/input").send_keys("juyeonglee911029@gmail.com")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.find_element(By.XPATH, "/html/body/div[1]/ul/li[2]/div/ul/li[2]/div[2]/div/div/input").send_keys("12Qwaszx!@")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.find_element(By.XPATH, "/html/body/div[1]/ul/li[2]/div/ul/li[3]/button").click()
+                if stop_event.is_set(): return
+                time.sleep(4)
+                # OTP 폴링 시작 (B.C)
+                self.start_otp_polling(driver, stop_event, "OTP_ELEMENT_XPATH")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.get("https://scoutdata.feedconstruct.com/")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                while not stop_event.is_set():
+                    driver.refresh()
+                    time.sleep(18)
+                    try:
+                        element = WebDriverWait(driver, 30).until(
+                            EC.presence_of_element_located((By.XPATH, "/html/body/app-root/app-app/div/div[1]/app-header/div/div/div/div/div[3]/div[1]/span[2]"))
+                        )
+                        formatted = element.text.strip()
+                        self.after(0, self.update_field, formatted, field_name, side)
+                    except Exception as e:
+                        print("B.C 입금 크롤링 오류:", e)
+                        self.after(0, self.update_field, "0", field_name, side)
+                    time.sleep(1)
+            except Exception as e:
+                print("B.C 입금 시퀀스 오류:", e)
+            finally:
+                driver.quit()
+        elif field_name == "VECT PAY" and side == "right":
+            options = Options()
+            options.headless = False
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            try:
+                driver.get("https://nid.naver.com/nidlogin.login")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.find_element(By.XPATH, "/html/body/div[1]/div[2]/div/div[1]/form/ul/li/div/div[1]/div/div[1]/input").send_keys("YOUR_VECT_ID")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.find_element(By.XPATH, "/html/body/div[1]/div[2]/div/div[1]/form/ul/li/div/div[1]/div/div[2]/input").send_keys("YOUR_VECT_PASSWORD")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.find_element(By.XPATH, "/html/body/div[1]/div[2]/div/div[1]/form/ul/li/div/div[11]/button").click()
+                if stop_event.is_set(): return
+                time.sleep(4)
+                self.start_otp_polling(driver, stop_event, "OTP_ELEMENT_XPATH")
+                if stop_event.is_set(): return
+                driver.get("https://m.stock.naver.com/worldstock/home/USA/marketValue/NASDAQ")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                while not stop_event.is_set():
+                    driver.refresh()
+                    time.sleep(18)
+                    try:
+                        element = WebDriverWait(driver, 30).until(
+                            EC.presence_of_element_located((By.XPATH, "/html/body/div[1]/div[1]/div[2]/div/div[3]/div[1]/ul/li[1]/a/div[1]/span[1]"))
+                        )
+                        processed_text = element.text[1:]
+                        try:
+                            number = int(processed_text.replace(',', ''))
+                            formatted = format_money(number)
+                        except:
+                            formatted = processed_text
+                        self.after(0, self.update_field, formatted, field_name, side)
+                    except Exception as e:
+                        print("VECT PAY 크롤링 오류:", e)
+                        self.after(0, self.update_field, "0", field_name, side)
+                    time.sleep(1)
+            except Exception as e:
+                print("VECT PAY 시퀀스 오류:", e)
+            finally:
+                driver.quit()
+        elif field_name == "WING PAY" and side == "right":
+            options = Options()
+            options.headless = False
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            try:
+                driver.get("https://m.stock.naver.com/domestic/capitalization/total")
+                if stop_event.is_set(): return
+                time.sleep(18)
+                try:
+                    element = WebDriverWait(driver, 30).until(
+                        EC.presence_of_element_located((By.XPATH, "/html/body/div[1]/div[1]/div[2]/div/div[3]/div[1]/ul/li[1]/a/div[1]/span[1]"))
+                    )
+                    formatted = format_money(element.text.strip())
+                    self.after(0, self.update_field, formatted, field_name, side)
+                except Exception as e:
+                    print("WING PAY 크롤링 오류:", e)
+                    self.after(0, self.update_field, "0", field_name, side)
+                while not stop_event.is_set():
+                    driver.refresh()
+                    time.sleep(18)
+                    try:
+                        element = WebDriverWait(driver, 30).until(
+                            EC.presence_of_element_located((By.XPATH, "/html/body/div[1]/div[1]/div[2]/div/div/div[6]/div[1]/table/tbody/tr[1]/td[5]"))
+                        )
+                        formatted = format_money(element.text.strip())
+                        self.after(0, self.update_field, formatted, field_name, side)
+                    except Exception as e:
+                        print("WING PAY 크롤링 오류:", e)
+                        self.after(0, self.update_field, "0", field_name, side)
+                    time.sleep(1)
+            except Exception as e:
+                print("WING PAY 시퀀스 오류:", e)
+            finally:
+                driver.quit()
+        elif field_name == "B.C 출금" and side == "withdraw_left":
+            options = Options()
+            options.headless = False
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            try:
+                driver.get("https://www.accounts-bc.com/signin")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.find_element(By.XPATH, "/html/body/div[1]/ul/li[2]/div/ul/li[2]/div[1]/div/input").send_keys("juyeonglee911029@gmail.com")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.find_element(By.XPATH, "/html/body/div[1]/ul/li[2]/div/ul/li[2]/div[2]/div/div/input").send_keys("12Qwaszx!@")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.find_element(By.XPATH, "/html/body/div[1]/ul/li[2]/div/ul/li[3]/button").click()
+                if stop_event.is_set(): return
+                time.sleep(4)
+                try:
+                    otp_elem = driver.find_element(By.XPATH, "/html/body/div[1]/ul/li[2]/div/ul/li[2]/div/div[1]/div/input")
+                    self.start_otp_polling(driver, stop_event, "OTP_ELEMENT_XPATH")
+                except Exception:
+                    self.show_login_success_message("계좌 로그인 성공")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.get("https://scoutdata.feedconstruct.com/")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                while not stop_event.is_set():
+                    driver.refresh()
+                    time.sleep(18)
+                    try:
+                        element = WebDriverWait(driver, 30).until(
+                            EC.presence_of_element_located((By.XPATH, "/html/body/app-root/app-auth/div/div[2]/app-login/div/div[1]/div"))
+                        )
+                        updated_value = element.text
+                        sub_text = updated_value[3:-1]
+                        try:
+                            number = int(sub_text.replace(',', ''))
+                            formatted = format_money(number)
+                        except:
+                            formatted = sub_text
+                        self.after(0, self.update_field, formatted, field_name, side)
+                    except Exception as e:
+                        print("B.C 출금 크롤링 오류:", e)
+                        self.after(0, self.update_field, "0", field_name, side)
+                    time.sleep(1)
+            except Exception as e:
+                print("B.C 출금 시퀀스 오류:", e)
+            finally:
+                driver.quit()
+        elif field_name == "VECT PAY 출금" and side == "right":
+            options = Options()
+            options.headless = False
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            try:
+                driver.get("https://nid.naver.com/nidlogin.login")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.find_element(By.XPATH, "/html/body/div[1]/div[2]/div/div[1]/form/ul/li/div/div[1]/div/div[1]/input").send_keys("YOUR_VECT_ID")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.find_element(By.XPATH, "/html/body/div[1]/div[2]/div/div[1]/form/ul/li/div/div[1]/div/div[2]/input").send_keys("YOUR_VECT_PASSWORD")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                driver.find_element(By.XPATH, "/html/body/div[1]/div[2]/div/div[1]/form/ul/li/div/div[11]/button").click()
+                if stop_event.is_set(): return
+                time.sleep(4)
+                try:
+                    otp_elem = driver.find_element(By.XPATH, "OTP_ELEMENT_XPATH")
+                    self.start_otp_polling(driver, stop_event, "OTP_ELEMENT_XPATH")
+                except Exception:
+                    self.show_login_success_message("로그인 성공")
+                if stop_event.is_set(): return
+                driver.get("https://m.stock.naver.com/worldstock/home/USA/marketValue/NASDAQ")
+                if stop_event.is_set(): return
+                time.sleep(4)
+                while not stop_event.is_set():
+                    driver.refresh()
+                    time.sleep(18)
+                    try:
+                        element = WebDriverWait(driver, 30).until(
+                            EC.presence_of_element_located((By.XPATH, "/html/body/div[1]/div[1]/div[2]/div/div/div[3]/div[1]/div[1]/strong"))
+                        )
+                        processed_text = element.text[:-1]
+                        try:
+                            number = int(processed_text.replace(',', ''))
+                            formatted = format_money(number)
+                        except:
+                            formatted = processed_text
+                        self.after(0, self.update_field, formatted, field_name, side)
+                    except Exception as e:
+                        print("VECT PAY 출금 크롤링 오류:", e)
+                        self.after(0, self.update_field, "0", field_name, side)
+                    time.sleep(1)
+            except Exception as e:
+                print("VECT PAY 출금 시퀀스 오류:", e)
+            finally:
+                driver.quit()
+        else:
+            dummy_values = {
+                "WING PAY": 250000,
+                "GOLD PAY 잔액": 400000,
+                "GOLD PAY 출금": 350000,
+                "LVL 장": 500000,
+                "B.C 출금": 1800000,
+                "환정장 출금": 0,
+                "VECT PAY 출금": 300000,
+                "뒷장": 0,
+                "일일 한도": 0,
+                "잔여 한도": 0
+            }
+            while not stop_event.is_set():
+                value = dummy_values.get(field_name, 0)
+                fmt_val = format_money(value)
+                self.after(0, self.update_field, fmt_val, field_name, side)
+                time.sleep(4)
+        key = (field_name, side)
+        self.after(0, lambda: self.start_buttons[key].config(text="시작", style="Start.TButton"))
+        if key in self.crawling_control:
+            self.crawling_control.pop(key)
+    
+    def update_field(self, value, field_name, side):
+        if side == "left":
+            if field_name in self.left_fields:
+                self.left_fields[field_name].set(value)
+                self.left_entries[field_name].configure(fg=self.crawling_fg)
+            elif field_name in self.withdraw_left_fields:
+                self.withdraw_left_fields[field_name].set(value)
+                self.withdraw_left_entries[field_name].configure(fg=self.crawling_fg)
+        elif side == "right":
+            if field_name in self.right_fields:
+                self.right_fields[field_name].set(value)
+                self.right_entries[field_name].configure(fg=self.crawling_fg)
+            elif field_name in self.withdraw_right_fields:
+                self.withdraw_right_fields[field_name].set(value)
+                self.withdraw_right_entries[field_name].configure(fg=self.crawling_fg)
+        self.recalc_deposit()
+        self.recalc_withdrawal()
+    
+    def show_otp_input(self, driver, otp_elem):
+        def send_otp():
+            otp_value = otp_entry.get()
+            try:
+                otp_elem.clear()
+                otp_elem.send_keys(otp_value + Keys.ENTER)
+            except Exception as e:
+                print("OTP 전송 오류:", e)
+            top.destroy()
+        top = tk.Toplevel(self)
+        top.title("OTP 입력")
+        tk.Label(top, text="OTP 입력:", font=self.custom_font).pack(padx=10, pady=5)
+        otp_entry = tk.Entry(top, font=self.custom_font)
+        otp_entry.pack(padx=10, pady=5)
+        send_btn = ttk.Button(top, text="전송", command=send_otp, width=self.btn_width)
+        send_btn.pack(padx=10, pady=5)
+        top.grab_set()
+    
+    def show_login_success_message(self, msg):
+        success_lbl = ttk.Label(self, text=msg, foreground="lime")
+        success_lbl.place(relx=0, rely=1.0, anchor="sw", x=10, y=-10)
+        self.after(2000, lambda: success_lbl.destroy())
+    
+    def recalc_deposit(self):
         try:
-            if hasattr(self, 'main_interface'):
-                del self.main_interface
-        except Exception as e:
-            print("종료 시 오류:", e)
-        event.accept()
-
-##############################################
-# 종료 처리 함수
-##############################################
-def cleanup():
-    print("프로그램 종료, 모든 브라우저 종료")
-atexit.register(cleanup)
-
-##############################################
-# 메인 함수
-##############################################
-def main():
-    app = QApplication(sys.argv)
-    app.setStyleSheet("""
-* {
-    font-family: 'Malgun Gothic', sans-serif;
-}
-QWidget {
-    background-color: #F0F0F0;
-    color: #333333;
-}
-QGroupBox {
-    background-color: #FFFFFF;
-    border: none;
-}
-QLineEdit {
-    background-color: black;
-    border: none;
-    border-radius: 5px;
-    padding: 6px;
-    font-size: 11pt;
-    color: white;
-}
-QPushButton {
-    background-color: #E0E0E0;
-    border: none;
-    border-radius: 5px;
-    padding: 8px 16px;
-    font-size: 9pt;
-    color: #333333;
-}
-QPushButton:hover {
-    background-color: #D0D0D0;
-}
-QCheckBox {
-    font-size: 12pt;
-    color: #333333;
-}
-QTextEdit {
-    background-color: #D3D3D3;
-    border: none;
-    font-size: 11pt;
-    color: #333333;
-}
-""")
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
-
-if __name__ == "__main__":
-    main()
-
-
-
-
-####################################################################################################
-# FINAL_SETTLEMENT_SYSTEM.PY (최종 수정본 v7.3.9)
-# 제작자: ChatGPT
-# 작성일: 2025-02-27
-#
-# [변경 사항]
-# 1. 모든 텍스트 입력창은 5초 단위로 업데이트되며, 값이 없으면 "0"으로 표시됨.
-# 2. 자동 데이터는 빨간색, 수동 입력 시 흰색으로 표시됨.
-# 3. GUI는 5행×2열 그리드 레이아웃으로 구성됨.
-#    - 행0: 좌측 – "B.C" (자동 업데이트 필드, 수정 버튼, config의 otp_xpath가 있을 경우에만 OTP 입력창/전송 버튼),
-#            우측 – "VECT PAY"
-#    - 행1: 좌측 – "합계", 우측 – "WING PAY"
-#    - 행2: 좌측 – "정산 결과", 우측 – "LEVEL 장"
-#    - 행3: 좌측 – "중복 승인" (수동 입력), 우측 – "개인장 출금"
-#    - 행4: 좌측 – "입금 후 미신청" (수동 입력), 우측 – "개인장 잔액"
-#    하단에 결과 메시지와 최종 정상 시각이 전체 너비로 배치됨.
-# 4. 수정/전송 버튼은 AnimatedButton 클래스로 구현되며, 수정 버튼 클릭 시 입력창이 편집 가능해지고,
-#    완료 버튼 클릭 시 애니메이션 효과와 함께 읽기전용 및 배경색 변경으로 잠금 상태를 표시함.
-# 5. 모든 자동/수동 입력창은 Ctrl+C & Ctrl+V 단축키로 복사/붙여넣기 기능을 지원함.
-# 6. OTP 입력창과 전송 버튼은 config의 otp_xpath 정보가 있을 때만 GUI에 노출됨.
-# 7. VECT PAY는 최종 크롤링 시, final_crawl_xpath에서 26번째 글자부터 추출한 후 숫자만 남기고 천단위 콤마 포맷 적용.
-# 8. 정산 결과는 (B.C + 중복 승인) – [(WING PAY + VECT PAY + LEVEL 장 + 개인장 출금 + 개인장 잔액) – (입금 후 미신청)]
-#    수식으로 계산됨.
-####################################################################################################
-
-import sys, os, time, re, atexit, subprocess, functools
-from datetime import datetime
-
-from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QLineEdit, QPushButton, QLabel,
-    QMainWindow, QMessageBox, QHBoxLayout, QStackedWidget, QGridLayout, QGroupBox, QGraphicsOpacityEffect
-)
-from PyQt5.QtCore import QRegExp, Qt, QTimer, QPropertyAnimation, pyqtSignal, QThread, QVariantAnimation
-from PyQt5.QtGui import QRegExpValidator, QColor, QGuiApplication
-from PyQt5.QtWebEngineWidgets import QWebEngineView
-
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
-from webdriver_manager.chrome import ChromeDriverManager
-
-##############################################
-# AnimatedButton: 수정/전송 버튼 (호버 효과 및 스타일)
-##############################################
-class AnimatedButton(QPushButton):
-    def __init__(self, text=""):
-        super().__init__(text)
-        self.setStyleSheet("background-color: #2196F3; border: none; border-radius: 10px; font-size: 13pt; color: white;")
-        self.anim = QVariantAnimation(self)
-        self.anim.setDuration(500)
-        self.anim.valueChanged.connect(self.on_value_changed)
-    def on_value_changed(self, value):
-        base_color = QColor("#2196F3")
-        hover_color = QColor("#0D47A1")
-        r = base_color.red() + (hover_color.red() - base_color.red()) * value
-        g = base_color.green() + (hover_color.green() - base_color.green()) * value
-        b = base_color.blue() + (hover_color.blue() - base_color.blue()) * value
-        new_color = QColor(int(r), int(g), int(b))
-        self.setStyleSheet(f"background-color: {new_color.name()}; border: none; border-radius: 10px; font-size: 13pt; color: white;")
-    def enterEvent(self, event):
-        self.anim.stop()
-        self.anim.setStartValue(0.0)
-        self.anim.setEndValue(1.0)
-        self.anim.start()
-        super().enterEvent(event)
-    def leaveEvent(self, event):
-        self.anim.stop()
-        self.anim.setStartValue(1.0)
-        self.anim.setEndValue(0.0)
-        self.anim.start()
-        super().leaveEvent(event)
-
-##############################################
-# NumberLineEdit (자동/수동 입력창, 복사/붙여넣기 지원)
-##############################################
-class NumberLineEdit(QLineEdit):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedWidth(200)
-        self.setValidator(QRegExpValidator(QRegExp("^[0-9]{0,11}$"), self))
-        self.textChanged.connect(self.formatText)
-    def formatText(self, text):
-        self.blockSignals(True)
-        digits = text.replace(",", "")
-        if digits == "":
-            self.blockSignals(False)
+            wing_pay = int(self.right_fields["WING PAY"].get().replace(',', ''))
+        except:
+            wing_pay = 0
+        try:
+            vect_pay = int(self.right_fields["VECT PAY"].get().replace(',', ''))
+        except:
+            vect_pay = 0
+        try:
+            gold_pay_balance = int(self.right_fields["GOLD PAY 잔액"].get().replace(',', ''))
+        except:
+            gold_pay_balance = 0
+        try:
+            gold_pay_withdraw = int(self.right_fields["GOLD PAY 출금"].get().replace(',', ''))
+        except:
+            gold_pay_withdraw = 0
+        try:
+            lvl = int(self.right_fields["LVL 장"].get().replace(',', ''))
+        except:
+            lvl = 0
+        try:
+            not_applied = int(self.left_fields["입금 후 미신청"].get().replace(',', ''))
+        except:
+            not_applied = 0
+        total = (wing_pay + vect_pay + gold_pay_withdraw + gold_pay_balance + lvl) - not_applied
+        self.left_fields["합계"].set(format_money(total))
+        try:
+            bc_val = int(self.left_fields["B.C"].get().replace(',', ''))
+        except:
+            bc_val = 0
+        settlement_result = bc_val - total
+        diff = abs(settlement_result)
+        if settlement_result == 0:
+            res_text = f"정상 (차이: {format_money(diff)})"
+            color = "lime"
+            self.deposit_settlement_label.config(text=f"최종 정산일치 시각: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            if settlement_result < 0:
+                res_text = f"입금 후 미신청 (부족: {format_money(diff)})"
+            else:
+                res_text = f"증복 승인 (초과: {format_money(diff)})"
+            color = "red"
+        self.left_fields["정산 결과"].set(res_text)
+        self.left_entries["정산 결과"].configure(fg=color)
+    
+    def toggle_edit_deposit(self, field_name, side):
+        self.deposit_editable[field_name] = True
+        ent = self.left_entries[field_name]
+        ent.configure(fg=self.manual_fg)
+        ent.focus_set()
+        ent.selection_range(0, tk.END)
+        self.recalc_deposit()
+    
+    def on_key_press_deposit(self, event, field_name):
+        if (field_name, "left") in self.crawling_control and not self.deposit_editable.get(field_name, False):
+            return "break"
+    
+    def on_numeric_key_release_deposit(self, event, field_name):
+        if (field_name, "left") in self.crawling_control and not self.deposit_editable.get(field_name, False):
+            return "break"
+        widget = event.widget
+        current = widget.get()
+        digits = ''.join(filter(str.isdigit, current))
+        if not digits:
+            widget.delete(0, tk.END)
+            self.recalc_deposit()
             return
         try:
             num = int(digits)
-            formatted = f"{num:,}"
-            self.setText(formatted)
-        except Exception:
-            pass
-        self.blockSignals(False)
-    def keyPressEvent(self, event):
-        if event.modifiers() & Qt.ControlModifier:
-            if event.key() == Qt.Key_C:
-                self.copy()
-                return
-            elif event.key() == Qt.Key_V:
-                self.paste()
-                return
-        super().keyPressEvent(event)
-
-##############################################
-# create_chrome_driver 및 옵션 설정
-##############################################
-def create_chrome_driver(options, retries=3):
-    for i in range(retries):
-        try:
-            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-            return driver
-        except Exception as e:
-            print(f"Chrome 드라이버 초기화 오류 (시도 {i+1}/{retries}): {e}")
-            time.sleep(2)
-    return None
-
-non_headless_options = webdriver.ChromeOptions()
-
-##############################################
-# 헬퍼 함수: format_number
-##############################################
-def format_number(value):
-    if not value.strip():
-        return "0"
-    try:
-        num = float(value.replace(",", "").strip())
-        return f"{int(num):,}"
-    except Exception:
-        return value
-
-##############################################
-# 사이트별 크롤링 스레드
-##############################################
-class SiteAutomationThread(QThread):
-    automation_complete = pyqtSignal(str)
-    otp_ready = pyqtSignal(str)
-    otp_hide = pyqtSignal(str)
-    def __init__(self, config, parent=None):
-        super().__init__(parent)
-        self.config = config
-    def run(self):
-        if self.config["site_name"] == "VECT PAY":
-            try:
-                driver = create_chrome_driver(non_headless_options)
-                if not driver:
-                    self.automation_complete.emit("Driver Init Failed")
-                    return
-                driver.maximize_window()
-                driver.get(self.config["login_url"])
-                WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config["login_id_xpath"])))
-                time.sleep(15)
-                driver.find_element(By.XPATH, self.config["login_id_xpath"]).clear()
-                driver.find_element(By.XPATH, self.config["login_id_xpath"]).send_keys(self.config["login_id"])
-                driver.find_element(By.XPATH, self.config["login_pw_xpath"]).clear()
-                driver.find_element(By.XPATH, self.config["login_pw_xpath"]).send_keys(self.config["login_pw"])
-                driver.find_element(By.XPATH, self.config["login_button_xpath"]).click()
-                time.sleep(15)
-                if self.config.get("otp_xpath", "").strip():
-                    try:
-                        otp_field = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config["otp_xpath"])))
-                        self.otp_ready.emit(self.config["site_name"])
-                        while self.config.get("otp_value", "") == "":
-                            time.sleep(0.5)
-                        otp_to_send = self.config.get("otp_value", "")
-                        if otp_to_send:
-                            otp_field.clear()
-                            otp_field.send_keys(otp_to_send + Keys.ENTER)
-                            self.config["otp_value"] = ""
-                            time.sleep(15)
-                    except Exception as e:
-                        print("VECT PAY OTP 요소 미발견:", e)
-                time.sleep(15)
-                while True:
-                    time.sleep(3)
-                    driver.refresh()
-                    elem = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config["final_crawl_xpath"])))
-                    raw_text = elem.text
-                    extracted_text = raw_text[25:] if len(raw_text) >= 26 else ""
-                    digits_only = re.sub(r"\D", "", extracted_text)
-                    if not digits_only:
-                        digits_only = "0"
-                    formatted_number = f"{int(digits_only):,}"
-                    self.automation_complete.emit(formatted_number)
-            except Exception as e:
-                print("VECT PAY 크롤링 오류:", e)
-                self.automation_complete.emit("Automation Error")
-            finally:
-                time.sleep(15)
-                driver.quit()
-            return
-        elif self.config["site_name"] == "B.C":
-            try:
-                driver = create_chrome_driver(non_headless_options)
-                if not driver:
-                    self.automation_complete.emit("Driver Init Failed")
-                    return
-                driver.maximize_window()
-                driver.get(self.config["login_url"])
-                WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config["login_id_xpath"])))
-                time.sleep(15)
-                driver.find_element(By.XPATH, self.config["login_id_xpath"]).clear()
-                driver.find_element(By.XPATH, self.config["login_id_xpath"]).send_keys(self.config["login_id"])
-                driver.find_element(By.XPATH, self.config["login_pw_xpath"]).clear()
-                driver.find_element(By.XPATH, self.config["login_pw_xpath"]).send_keys(self.config["login_pw"])
-                driver.find_element(By.XPATH, self.config["login_button_xpath"]).click()
-                time.sleep(15)
-                if self.config.get("otp_xpath", "").strip():
-                    try:
-                        otp_field = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config["otp_xpath"])))
-                        self.otp_ready.emit(self.config["site_name"])
-                        while self.config.get("otp_value", "") == "":
-                            time.sleep(0.5)
-                        otp_to_send = self.config.get("otp_value", "")
-                        if otp_to_send:
-                            otp_field.clear()
-                            otp_field.send_keys(otp_to_send + Keys.ENTER)
-                            self.config["otp_value"] = ""
-                            time.sleep(15)
-                    except Exception as e:
-                        print("B.C OTP 요소 미발견:", e)
-                time.sleep(15)
-                driver.get(self.config["post_login_url"])
-                while True:
-                    time.sleep(15)
-                    driver.refresh()
-                    elem = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config["final_crawl_xpath"])))
-                    text = elem.text
-                    if "." in text:
-                        text = text.split(".")[0]
-                    self.automation_complete.emit(text)
-            except Exception as e:
-                print("B.C 크롤링 오류:", e)
-                self.automation_complete.emit("Automation Error")
-            finally:
-                self.otp_hide.emit(self.config["site_name"])
-                time.sleep(15)
-                driver.quit()
-            return
-        elif self.config["site_name"] == "WING PAY":
-            try:
-                driver = create_chrome_driver(non_headless_options)
-                if not driver:
-                    self.automation_complete.emit("Driver Init Failed")
-                    return
-                driver.maximize_window()
-                driver.get(self.config["login_url"])
-                WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config["login_id_xpath"])))
-                time.sleep(20)
-                driver.find_element(By.XPATH, self.config["login_id_xpath"]).clear()
-                driver.find_element(By.XPATH, self.config["login_id_xpath"]).send_keys(self.config["login_id"])
-                driver.find_element(By.XPATH, self.config["login_pw_xpath"]).clear()
-                driver.find_element(By.XPATH, self.config["login_pw_xpath"]).send_keys(self.config["login_pw"])
-                driver.find_element(By.XPATH, self.config["login_button_xpath"]).click()
-                time.sleep(15)
-                driver.get("https://m.stock.naver.com/worldstock/home/USA/marketValue/NASDAQ")
-                while True:
-                    time.sleep(15)
-                    driver.refresh()
-                    elem = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config["final_crawl_xpath"])))
-                    text = elem.text
-                    if "." in text:
-                        text = text.split(".")[0]
-                    self.automation_complete.emit(text)
-            except Exception as e:
-                print("WING PAY 크롤링 오류:", e)
-                self.automation_complete.emit("Automation Error")
-            finally:
-                self.otp_hide.emit(self.config["site_name"])
-                time.sleep(15)
-                driver.quit()
-            return
-        try:
-            driver = create_chrome_driver(non_headless_options)
-            if not driver:
-                self.automation_complete.emit("Driver Init Failed")
-                return
-            driver.maximize_window()
-            while True:
-                self.perform_login(driver)
-                self.perform_post_login_actions(driver)
-                final_data = self.final_crawl(driver)
-                print(f"[{self.config['site_name']}] 최종 크롤링 데이터: {final_data}")
-                self.automation_complete.emit(final_data)
-                time.sleep(15)
-        except Exception as e:
-            print(f"SiteAutomationThread ({self.config['site_name']}) 오류:", e)
-            self.automation_complete.emit("Automation Error")
-        finally:
-            self.otp_hide.emit(self.config["site_name"])
-            driver.quit()
-
-    def perform_login(self, driver):
-        driver.get(self.config["login_url"])
-        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config["login_id_xpath"])))
-        time.sleep(15)
-        id_field = driver.find_element(By.XPATH, self.config["login_id_xpath"])
-        id_field.clear()
-        id_field.send_keys(self.config["login_id"])
-        pw_field = driver.find_element(By.XPATH, self.config["login_pw_xpath"])
-        pw_field.clear()
-        pw_field.send_keys(self.config["login_pw"])
-        driver.find_element(By.XPATH, self.config["login_button_xpath"]).click()
-        time.sleep(15)
-
-    def handle_otp(self, driver):
-        if self.config.get("otp_xpath", "").strip():
-            WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, self.config["otp_xpath"])))
-            self.otp_ready.emit(self.config["site_name"])
-            while self.config.get("otp_value", "") == "":
-                time.sleep(0.5)
-            otp_to_send = self.config.get("otp_value", "")
-            if otp_to_send:
-                otp_field = driver.find_element(By.XPATH, self.config["otp_xpath"])
-                otp_field.clear()
-                otp_field.send_keys(otp_to_send + Keys.ENTER)
-                self.config["otp_value"] = ""
-                time.sleep(15)
-        else:
-            pass
-
-    def perform_post_login_actions(self, driver):
-        driver.get(self.config["post_login_url"])
-        if "post_login_actions" in self.config:
-            actions = self.config["post_login_actions"]
-            for action in actions:
-                action_type = action.get("action")
-                xpath = action.get("xpath")
-                delay = action.get("delay", 1)
-                WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, xpath)))
-                if action_type == "click":
-                    driver.find_element(By.XPATH, xpath).click()
-                elif action_type == "input":
-                    input_value = action.get("value", "")
-                    elem = driver.find_element(By.XPATH, xpath)
-                    elem.clear()
-                    elem.send_keys(input_value)
-                time.sleep(delay)
-        else:
-            pass
-
-    def final_crawl(self, driver):
-        final_elem = driver.find_element(By.XPATH, self.config["final_crawl_xpath"])
-        return final_elem.text
-
-##############################################
-# 사이트 설정
-##############################################
-site_configs = {
-    "B.C": {
-        "login_url": "https://www.accounts-bc.com/signin",
-        "login_id": "juyeonglee911029@gmail.com",
-        "login_pw": "12Qwaszx!@",
-        "login_id_xpath": "/html/body/div[1]/ul/li[2]/div/ul/li[2]/div[1]/div/input",
-        "login_pw_xpath": "/html/body/div[1]/ul/li[2]/div/ul/li[2]/div[2]/div/div/input",
-        "login_button_xpath": "/html/body/div[1]/ul/li[2]/div/ul/li[3]/button",
-        "otp_xpath": "/html/body/div[1]/ul/li[2]/div/ul/li[2]/div/div[1]/div/input",
-        "post_login_url": "https://scoutdata.feedconstruct.com/",
-        "click_xpath1": "", "click_xpath2": "", "click_xpath3": "",
-        "final_crawl_xpath": "/html/body/app-root/app-app/div/div[2]/app-game-section/div/div/div[2]/div/div[1]/div/div/mat-form-field/div[1]/div[2]/div[1]/input",
-        "otp_value": "",
-        "site_name": "B.C"
-    },
-    "VECT PAY": {
-        "login_url": "https://kba-europe.com/login/?redirect_to=https%3A%2F%2Fkba-europe.com",
-        "login_id": "아이디에요",
-        "login_pw": "비번이에요",
-        "login_id_xpath": "/html/body/div[1]/div/div[3]/div[1]/div/div/div[3]/div[2]/div/div/div/div/div/div/form/div/div[1]/div/div[1]/div[1]/input",
-        "login_pw_xpath": "/html/body/div[1]/div/div[3]/div[1]/div/div/div[3]/div[2]/div/div/div/div/div/div/form/div/div[1]/div/div[1]/div[2]/input",
-        "login_button_xpath": "/html/body/div[1]/div/div[3]/div[1]/div/div/div[3]/div[2]/div/div/div/div/div/div/form/div/div[1]/div/div[2]/button",
-        "otp_xpath": "/html/body/div[1]/div/div[3]/div[1]/div/div/div[3]/div[2]/div/div/div/div/div/div[2]/form/div/div[1]/div/div[1]/div[1]/input",
-        "post_login_url": "https://www.winglobalpay.com/",
-        "click_xpath1": "/html/body/div[1]/div[1]/header/button[1]",
-        "click_xpath2": "/html/body/div[1]/div[2]/nav/ul/li[2]/a",
-        "click_xpath3": "/html/body/div[1]/div[2]/nav/ul/li[2]/ul/li[1]/a",
-        "final_crawl_xpath": "/html/body/div[1]/div/div[3]/div[2]/div/div/div/div/div/div/div[2]/ul/li[3]",
-        "otp_value": "",
-        "site_name": "VECT PAY"
-    },
-    "WING PAY": {
-        "login_url": "https://nid.naver.com/nidlogin.login?mode=form&url=https://www.naver.com/",
-        "login_id": "아이디입니다",
-        "login_pw": "비밀번호입니다",
-        "login_id_xpath": "/html/body/div[1]/div[2]/div/div[1]/form/ul/li/div/div[1]/div/div[1]/input",
-        "login_pw_xpath": "/html/body/div[1]/div[2]/div/div[1]/form/ul/li/div/div[1]/div/div[2]/input",
-        "login_button_xpath": "/html/body/div[1]/div[2]/div/div[1]/form/ul/li/div/div[11]/button",
-        "otp_xpath": "",
-        "post_login_url": "",
-        "click_xpath1": "", "click_xpath2": "", "click_xpath3": "",
-        "final_crawl_xpath": "/html/body/div[1]/div[1]/div[2]/div/div/div[4]/div[1]/div/div[1]/div/ul/li[1]/a/span",
-        "otp_value": "",
-        "site_name": "WING PAY"
-    },
-    "개인장 출금": {
-        "login_url": "https://www.pushbullet.com/1",
-        "login_id": "your_gein_id",
-        "login_pw": "your_gein_pw",
-        "login_id_xpath": "XPath_GEIN_LOGIN_ID",
-        "login_pw_xpath": "XPath_GEIN_LOGIN_PW",
-        "login_button_xpath": "XPath_GEIN_LOGIN_BTN",
-        "otp_xpath": "",
-        "post_login_url": "https://www.pushbullet.com/1",
-        "click_xpath1": "XPath_GEIN_CLICK1",
-        "click_xpath2": "XPath_GEIN_CLICK2",
-        "click_xpath3": "XPath_GEIN_CLICK3",
-        "final_crawl_xpath": "XPath_GEIN_FINAL",
-        "otp_value": "",
-        "site_name": "개인장 출금"
-    },
-    "개인장 잔액": {
-        "login_url": "https://www.pushbullet.com/1",
-        "login_id": "your_gein_id",
-        "login_pw": "your_gein_pw",
-        "login_id_xpath": "XPath_GEIN_LOGIN_ID",
-        "login_pw_xpath": "XPath_GEIN_LOGIN_PW",
-        "login_button_xpath": "XPath_GEIN_LOGIN_BTN",
-        "otp_xpath": "",
-        "post_login_url": "https://www.pushbullet.com/1",
-        "click_xpath1": "XPath_GEIN_CLICK1",
-        "click_xpath2": "XPath_GEIN_CLICK2",
-        "click_xpath3": "XPath_GEIN_CLICK3",
-        "final_crawl_xpath": "XPath_GEIN_FINAL",
-        "otp_value": "",
-        "site_name": "개인장 잔액"
-    },
-    "LEVEL 장": {
-        "login_url": "https://www.pushbullet.com/1",
-        "login_id": "your_level_id",
-        "login_pw": "your_level_pw",
-        "login_id_xpath": "XPath_LEVEL_LOGIN_ID",
-        "login_pw_xpath": "XPath_LEVEL_LOGIN_PW",
-        "login_button_xpath": "XPath_LEVEL_LOGIN_BTN",
-        "otp_xpath": "",
-        "post_login_url": "https://www.netflix.com/dashboard",
-        "click_xpath1": "XPath_LEVEL_CLICK1",
-        "click_xpath2": "XPath_LEVEL_CLICK2",
-        "click_xpath3": "XPath_LEVEL_CLICK3",
-        "final_crawl_xpath": "XPath_LEVEL_FINAL",
-        "otp_value": "",
-        "site_name": "LEVEL 장"
-    }
-}
-
-##############################################
-# Login 화면
-##############################################
-class LoginWidget(QWidget):
-    login_success = pyqtSignal(str)
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setup_ui()
-    def setup_ui(self):
-        self.setMinimumSize(300,150)
-        main_layout = QVBoxLayout(self)
-        main_layout.setAlignment(Qt.AlignCenter)
-        form_group = QGroupBox("")
-        form_group.setStyleSheet("background-color: #FFFFFF; border: none;")
-        form_layout = QVBoxLayout()
-        self.username_edit = QLineEdit()
-        self.username_edit.setPlaceholderText("아이디")
-        self.username_edit.setFixedHeight(30)
-        self.username_edit.setText("EXTA")
-        self.username_edit.setStyleSheet("font-size: 10pt; color: #333333; background-color: #D3D3D3;")
-        self.username_edit.setFixedWidth(120)
-        self.password_edit = QLineEdit()
-        self.password_edit.setPlaceholderText("비밀번호")
-        self.password_edit.setEchoMode(QLineEdit.Password)
-        self.password_edit.setFixedHeight(30)
-        self.password_edit.setText("papa")
-        self.password_edit.setStyleSheet("font-size: 10pt; color: #333333; background-color: #D3D3D3;")
-        self.password_edit.setFixedWidth(120)
-        form_layout.addWidget(QLabel("ID :"))
-        form_layout.addWidget(self.username_edit)
-        form_layout.addWidget(QLabel("Password :"))
-        form_layout.addWidget(self.password_edit)
-        form_group.setLayout(form_layout)
-        main_layout.addWidget(form_group, alignment=Qt.AlignCenter)
-        self.login_button = AnimatedButton("로그인")
-        self.login_button.clicked.connect(self.handle_login)
-        self.login_button.setFixedSize(120,30)
-        main_layout.addWidget(self.login_button, alignment=Qt.AlignCenter)
-        self.success_label = QLabel("로그인 성공")
-        self.success_label.setAlignment(Qt.AlignCenter)
-        self.success_label.setStyleSheet("color: green; font-size: 12pt;")
-        self.success_label.setVisible(False)
-        main_layout.addWidget(self.success_label, alignment=Qt.AlignCenter)
-    def handle_login(self):
-        if self.username_edit.text().strip() == "EXTA" and self.password_edit.text().strip() == "papa":
-            self.show_success_message()
-        else:
-            QMessageBox.warning(self, "오류", "아이디 또는 비밀번호가 올바르지 않습니다.")
-    def show_success_message(self):
-        self.success_label.setVisible(True)
-        QTimer.singleShot(2000, self.fade_out_success_message)
-    def fade_out_success_message(self):
-        effect = QGraphicsOpacityEffect(self.success_label)
-        self.success_label.setGraphicsEffect(effect)
-        self.anim = QPropertyAnimation(effect, b"opacity")
-        self.anim.setDuration(1000)
-        self.anim.setStartValue(1)
-        self.anim.setEndValue(0)
-        self.anim.finished.connect(lambda: self.login_success.emit("EXTA"))
-        self.anim.start()
-
-##############################################
-# 메인 인터페이스 (5행×2열 그리드 레이아웃)
-##############################################
-class MainInterfaceWidget(QWidget):
-    def __init__(self, login_id, parent=None):
-        super().__init__(parent)
-        self.login_id = login_id
-        self.modify_buttons = {}
-        self.fetch_edits = {}
-        self.otp_inputs = {}  # OTP 위젯은 config의 otp_xpath가 있을 때만 추가됨
-        self.send_buttons = {}
-        self.bottom_info = QLabel("")
-        self.last_success_label = QLabel("")
-        self.last_success_label.setStyleSheet("font-size: 15pt; color: blue; font-weight: bold;")
-        self.result_msg_label = QLabel("")
-        self.result_msg_label.setVisible(False)
-        self.configs = site_configs
-        self.setup_ui()
-        self.start_timer()
-        QTimer.singleShot(5000, self.start_site_automation_all)
-    def setup_ui(self):
-        main_layout = QVBoxLayout(self)
-        main_layout.setSpacing(10)
-        title = QLabel("자동 정산 시스템")
-        title.setStyleSheet("font-size: 13pt; color: #0066CC;")
-        main_layout.addWidget(title)
-        grid = QGridLayout()
-        grid.setSpacing(5)
-        # 행0: 좌측 – B.C, 우측 – VECT PAY
-        grid.addWidget(QLabel("B.C"), 0, 0)
-        bc_widget = QWidget()
-        bc_layout = QHBoxLayout(bc_widget)
-        bc_layout.setContentsMargins(0,0,0,0)
-        bc_layout.setSpacing(5)
-        bc_field = NumberLineEdit()
-        bc_field.setReadOnly(True)
-        bc_field.setPlaceholderText("자동 업데이트 / 수동 입력")
-        bc_field.setAlignment(Qt.AlignCenter)
-        bc_field.setStyleSheet("font-size: 11pt; color: white; background-color: black;")
-        bc_layout.addWidget(bc_field)
-        self.fetch_edits["B.C"] = bc_field
-        bc_btn = AnimatedButton("수정")
-        bc_btn.setFixedSize(60,30)
-        bc_btn.clicked.connect(lambda checked, s="B.C": self.modify_auto_update(s))
-        bc_layout.addWidget(bc_btn)
-        self.modify_buttons["B.C"] = bc_btn
-        if self.configs["B.C"].get("otp_xpath", "").strip():
-            otp_bc = QLineEdit()
-            otp_bc.setMaxLength(6)
-            otp_bc.setPlaceholderText("OTP 입력")
-            otp_bc.setAlignment(Qt.AlignCenter)
-            otp_bc.setStyleSheet("font-size: 11pt; color: white; background-color: black;")
-            otp_bc.setFixedSize(100,30)
-            bc_layout.addWidget(otp_bc)
-            self.otp_inputs["B.C"] = otp_bc
-            send_bc = AnimatedButton("전송")
-            send_bc.setFixedSize(60,30)
-            send_bc.setStyleSheet("color: #0066CC; background-color: transparent;")
-            send_bc.clicked.connect(lambda checked, s="B.C": self.send_otp(s))
-            bc_layout.addWidget(send_bc)
-            self.send_buttons["B.C"] = send_bc
-        grid.addWidget(bc_widget, 0, 1)
-        grid.addWidget(QLabel("VECT PAY"), 0, 2)
-        vp_field = NumberLineEdit()
-        vp_field.setReadOnly(True)
-        vp_field.setPlaceholderText("자동 업데이트 / 수동 입력")
-        vp_field.setAlignment(Qt.AlignCenter)
-        vp_field.setStyleSheet("font-size: 11pt; color: white; background-color: black;")
-        grid.addWidget(vp_field, 0, 3)
-        self.fetch_edits["VECT PAY"] = vp_field
-        # 행1: 좌측 – 합계, 우측 – WING PAY
-        grid.addWidget(QLabel("합계"), 1, 0)
-        sum_field = NumberLineEdit()
-        sum_field.setReadOnly(True)
-        sum_field.setText("0")
-        sum_field.setAlignment(Qt.AlignCenter)
-        sum_field.setStyleSheet("font-size: 11pt; color: white; background-color: black;")
-        grid.addWidget(sum_field, 1, 1)
-        self.sum_edit = sum_field
-        grid.addWidget(QLabel("WING PAY"), 1, 2)
-        wing_field = NumberLineEdit()
-        wing_field.setReadOnly(True)
-        wing_field.setPlaceholderText("자동 업데이트 / 수동 입력")
-        wing_field.setAlignment(Qt.AlignCenter)
-        wing_field.setStyleSheet("font-size: 11pt; color: white; background-color: black;")
-        grid.addWidget(wing_field, 1, 3)
-        self.fetch_edits["WING PAY"] = wing_field
-        # 행2: 좌측 – 정산 결과, 우측 – LEVEL 장
-        grid.addWidget(QLabel("정산 결과"), 2, 0)
-        result_field = NumberLineEdit()
-        result_field.setReadOnly(True)
-        result_field.setText("0")
-        result_field.setAlignment(Qt.AlignCenter)
-        result_field.setStyleSheet("font-size: 11pt; color: white; background-color: black;")
-        grid.addWidget(result_field, 2, 1)
-        self.settlement_edit = result_field
-        grid.addWidget(QLabel("LEVEL 장"), 2, 2)
-        level_field = NumberLineEdit()
-        level_field.setReadOnly(True)
-        level_field.setPlaceholderText("자동 업데이트 / 수동 입력")
-        level_field.setAlignment(Qt.AlignCenter)
-        level_field.setStyleSheet("font-size: 11pt; color: white; background-color: black;")
-        grid.addWidget(level_field, 2, 3)
-        self.fetch_edits["LEVEL 장"] = level_field
-        # 행3: 좌측 – 중복 승인, 우측 – 개인장 출금
-        grid.addWidget(QLabel("중복 승인"), 3, 0)
-        approval_field = NumberLineEdit()
-        approval_field.setReadOnly(True)
-        approval_field.setPlaceholderText("수동 입력")
-        approval_field.setAlignment(Qt.AlignCenter)
-        approval_field.setStyleSheet("font-size: 11pt; color: white; background-color: black;")
-        grid.addWidget(approval_field, 3, 1)
-        self.fetch_edits["중복 승인"] = approval_field
-        grid.addWidget(QLabel("개인장 출금"), 3, 2)
-        out_field = NumberLineEdit()
-        out_field.setReadOnly(True)
-        out_field.setPlaceholderText("자동 업데이트 / 수동 입력")
-        out_field.setAlignment(Qt.AlignCenter)
-        out_field.setStyleSheet("font-size: 11pt; color: white; background-color: black;")
-        grid.addWidget(out_field, 3, 3)
-        self.fetch_edits["개인장 출금"] = out_field
-        # 행4: 좌측 – 입금 후 미신청, 우측 – 개인장 잔액
-        grid.addWidget(QLabel("입금 후 미신청"), 4, 0)
-        notapplied_field = NumberLineEdit()
-        notapplied_field.setReadOnly(True)
-        notapplied_field.setPlaceholderText("수동 입력")
-        notapplied_field.setAlignment(Qt.AlignCenter)
-        notapplied_field.setStyleSheet("font-size: 11pt; color: white; background-color: black;")
-        grid.addWidget(notapplied_field, 4, 1)
-        self.fetch_edits["입금 후 미신청"] = notapplied_field
-        grid.addWidget(QLabel("개인장 잔액"), 4, 2)
-        balance_field = NumberLineEdit()
-        balance_field.setReadOnly(True)
-        balance_field.setPlaceholderText("자동 업데이트 / 수동 입력")
-        balance_field.setAlignment(Qt.AlignCenter)
-        balance_field.setStyleSheet("font-size: 11pt; color: white; background-color: black;")
-        grid.addWidget(balance_field, 4, 3)
-        self.fetch_edits["개인장 잔액"] = balance_field
-        main_layout.addLayout(grid)
-        main_layout.addWidget(self.result_msg_label)
-        main_layout.addWidget(self.last_success_label)
-        bottom_layout = QHBoxLayout()
-        bottom_layout.addStretch()
-        self.bottom_info = QLabel(f"사용자: {self.login_id}    {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
-        self.bottom_info.setStyleSheet("font-size: 12pt; color: #333333;")
-        bottom_layout.addWidget(self.bottom_info)
-        bottom_layout.addStretch()
-        main_layout.addLayout(bottom_layout)
-        self.setLayout(main_layout)
-    def modify_auto_update(self, site):
-        field = self.fetch_edits.get(site)
-        btn = self.modify_buttons.get(site)
-        if field is None or btn is None:
-            return
-        if field.isReadOnly():
-            field.setReadOnly(False)
-            field.selectAll()
-            btn.setText("완료")
-            btn.setStyleSheet("color: #00FF00;")
-        else:
-            field.setReadOnly(True)
-            effect = QGraphicsOpacityEffect(field)
-            field.setGraphicsEffect(effect)
-            anim = QPropertyAnimation(effect, b"opacity")
-            anim.setDuration(500)
-            anim.setStartValue(1)
-            anim.setEndValue(0.7)
-            anim.start()
-            field.setStyleSheet("background-color: grey; color: white;")
-            btn.setText("수정")
-            btn.setStyleSheet("color: #0066CC;")
-            self.calculate_settlement()
-    def send_otp(self, site):
-        otp_val = self.otp_inputs[site].text() if self.otp_inputs.get(site) else ""
-        self.configs[site]["otp_value"] = otp_val
-        print(f"{site} OTP 전송: {otp_val}")
-        if self.otp_inputs.get(site):
-            self.otp_inputs[site].clear()
-    def calculate_settlement(self):
-        try:
-            bc_val = float(re.sub(r"[^\d\.]", "", self.fetch_edits.get("B.C").text()))
         except:
-            bc_val = 0.0
+            num = 0
+        fmt = format_money(num)
+        if current != fmt:
+            widget.delete(0, tk.END)
+            widget.insert(0, fmt)
+        widget.configure(fg=self.manual_fg)
+        self.recalc_deposit()
+    
+    def toggle_edit_deposit_right(self, field_name):
+        self.deposit_right_editable[field_name] = True
+        ent = self.right_entries[field_name]
+        ent.configure(fg=self.manual_fg)
+        ent.focus_set()
+        ent.selection_range(0, tk.END)
+        self.recalc_deposit()
+    
+    def on_key_press_deposit_right(self, event, field_name):
+        if (field_name, "right") in self.crawling_control and not self.deposit_right_editable.get(field_name, False):
+            return "break"
+    
+    def on_numeric_key_release_deposit_right(self, event, field_name):
+        if (field_name, "right") in self.crawling_control and not self.deposit_right_editable.get(field_name, False):
+            return "break"
+        widget = event.widget
+        current = widget.get()
+        digits = ''.join(filter(str.isdigit, current))
+        if not digits:
+            widget.delete(0, tk.END)
+            self.recalc_deposit()
+            return
         try:
-            approval = float(re.sub(r"[^\d\.]", "", self.fetch_edits.get("중복 승인").text()))
+            num = int(digits)
         except:
-            approval = 0.0
-        others_sum = 0.0
-        for site in ["WING PAY", "VECT PAY", "LEVEL 장", "개인장 출금", "개인장 잔액"]:
+            num = 0
+        fmt = format_money(num)
+        if current != fmt:
+            widget.delete(0, tk.END)
+            widget.insert(0, fmt)
+        widget.configure(fg=self.manual_fg)
+        self.recalc_deposit()
+    
+    def toggle_edit_withdraw_left(self, field_name):
+        self.withdraw_left_editable[field_name] = True
+        ent = self.withdraw_left_entries[field_name]
+        ent.configure(fg=self.manual_fg)
+        ent.focus_set()
+        ent.selection_range(0, tk.END)
+        self.recalc_withdrawal()
+    
+    def on_key_press_withdraw_left(self, event, field_name):
+        if (field_name, "withdraw_left") in self.crawling_control:
+            return "break"
+    
+    def on_numeric_key_release_withdraw_left(self, event, field_name):
+        if (field_name, "withdraw_left") in self.crawling_control:
+            return "break"
+        widget = event.widget
+        current = widget.get()
+        digits = ''.join(filter(str.isdigit, current))
+        if not digits:
+            widget.delete(0, tk.END)
+            self.recalc_withdrawal()
+            return
+        try:
+            num = int(digits)
+        except:
+            num = 0
+        fmt = format_money(num)
+        if current != fmt:
+            widget.delete(0, tk.END)
+            widget.insert(0, fmt)
+        widget.configure(fg=self.manual_fg)
+        self.recalc_withdrawal()
+    
+    def toggle_edit_withdraw(self, field_name):
+        self.withdraw_editable[field_name] = True
+        ent = self.withdraw_right_entries[field_name]
+        ent.configure(fg=self.manual_fg)
+        ent.focus_set()
+        ent.selection_range(0, tk.END)
+        self.recalc_withdrawal()
+    
+    def on_key_press_withdrawal(self, event, field_name):
+        if (field_name, "right") in self.crawling_control and not self.withdraw_editable.get(field_name, False):
+            return "break"
+    
+    def on_numeric_key_release_withdrawal(self, event, field_name):
+        if (field_name, "right") in self.crawling_control and not self.withdraw_editable.get(field_name, False):
+            return "break"
+        widget = event.widget
+        current = widget.get()
+        digits = ''.join(filter(str.isdigit, current))
+        if not digits:
+            widget.delete(0, tk.END)
+            self.recalc_withdrawal()
+            return
+        try:
+            num = int(digits)
+        except:
+            num = 0
+        fmt = format_money(num)
+        if current != fmt:
+            widget.delete(0, tk.END)
+            widget.insert(0, fmt)
+        widget.configure(fg=self.manual_fg)
+        self.recalc_withdrawal()
+    
+    def on_numeric_key_release_withdrawal_auto(self, event, field_name):
+        if (field_name, "right") in self.crawling_control and not self.withdraw_editable.get(field_name, False):
+            return "break"
+        widget = event.widget
+        current = widget.get()
+        digits = ''.join(filter(str.isdigit, current))
+        if not digits:
+            widget.delete(0, tk.END)
+            self.auto_update_hw()
+            self.recalc_withdrawal()
+            return
+        try:
+            num = int(digits)
+        except:
+            num = 0
+        fmt = format_money(num)
+        if current != fmt:
+            widget.delete(0, tk.END)
+            widget.insert(0, fmt)
+        widget.configure(fg=self.manual_fg)
+        self.auto_update_hw()
+        self.recalc_withdrawal()
+    
+    def auto_update_hw(self):
+        daily = self.withdraw_right_fields["일일 한도"].get()
+        remaining = self.withdraw_right_fields["잔여 한도"].get()
+        if daily and remaining:
             try:
-                others_sum += float(re.sub(r"[^\d\.]", "", self.fetch_edits.get(site).text()))
+                d = int(daily.replace(',', ''))
+                r = int(remaining.replace(',', ''))
+                computed = d - r
+                self.withdraw_right_fields["환정장 출금"].set(format_money(computed))
+                self.withdraw_right_entries["환정장 출금"].configure(fg=self.crawling_fg)
             except:
                 pass
+        self.recalc_withdrawal()
+    
+    def recalc_withdrawal(self):
         try:
-            not_applied = float(re.sub(r"[^\d\.]", "", self.fetch_edits.get("입금 후 미신청").text()))
+            bc_withdraw = int(self.withdraw_left_fields["B.C 출금"].get().replace(',', ''))
         except:
-            not_applied = 0.0
-        settlement = (bc_val + approval) - (others_sum - not_applied)
-        if settlement == 0:
-            self.settlement_edit.setText(f"{format_number(str(settlement))} (정상)")
-            self.settlement_edit.setStyleSheet("font-size: 15pt; color: green; background-color: black;")
-            self.result_msg_label.setText("")
-            self.last_success_label.setText(f"최종 정상 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            self.last_success_label.setStyleSheet("font-size: 15pt; color: blue; font-weight: bold;")
+            bc_withdraw = 0
+        try:
+            hw = int(self.withdraw_right_fields["환정장 출금"].get().replace(',', ''))
+        except:
+            hw = 0
+        try:
+            vect = int(self.withdraw_right_fields["VECT PAY 출금"].get().replace(',', ''))
+        except:
+            vect = 0
+        try:
+            back = int(self.withdraw_right_fields["뒷장"].get().replace(',', ''))
+        except:
+            back = 0
+        total = hw + vect + back
+        self.withdraw_left_fields["출금 합계"].set(format_money(total))
+        result = bc_withdraw - total
+        if result == 0 or result == back:
+            res_text = f"정상 (차이: {format_money(abs(result))})"
+            color = "lime"
+            self.withdraw_settlement_label.config(text=f"최종 정산일치 시각: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        elif result > 0:
+            res_text = f"증복 출금 (초과: {format_money(result)})"
+            color = "red"
         else:
-            self.settlement_edit.setText(f"{format_number(str(settlement))} (비정상)")
-            self.settlement_edit.setStyleSheet("font-size: 11pt; color: red; background-color: black;")
-            if (bc_val + approval) > (others_sum - not_applied):
-                msg = "증복입금 혹은 오승인 확인 요망."
-            else:
-                msg = "입금 후 미신청 또는 핑돈 확인 요망."
-            if msg == "입금 후 미신청 또는 핑돈 확인 요망.":
-                self.result_msg_label.setStyleSheet("font-size: 15pt; color: red; font-weight: bold;")
-            else:
-                self.result_msg_label.setStyleSheet("font-size: 15pt; color: red;")
-            self.result_msg_label.setText(msg)
-            self.result_msg_label.setVisible(True)
-    def update_time(self):
-        self.bottom_info.setText(f"사용자: {self.login_id}    {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
-    def start_timer(self):
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_time)
-        self.timer.start(1000)
-        self.update_time()
-    def start_site_automation_all(self):
-        self.site_auto_threads = []
-        for config in self.configs.values():
-            thread = SiteAutomationThread(config)
-            thread.automation_complete.connect(functools.partial(self.update_site_field, config["site_name"]))
-            thread.otp_ready.connect(functools.partial(self.otp_ready, config["site_name"]))
-            thread.otp_hide.connect(functools.partial(self.otp_hide, config["site_name"]))
-            thread.start()
-            self.site_auto_threads.append(thread)
-    def update_site_field(self, site, value):
-        field = self.fetch_edits.get(site)
-        if value == "Automation Error":
-            field.setText("X")
-        else:
-            if not value.strip():
-                value = "0"
-            field.setText(format_number(value))
-            field.setStyleSheet("font-size: 11pt; color: red; background-color: black;")
-        self.calculate_settlement()
-    def otp_ready(self, site, dummy):
-        if site in self.otp_inputs:
-            self.otp_inputs[site].setVisible(True)
-        if site in self.send_buttons:
-            self.send_buttons[site].setVisible(True)
-    def otp_hide(self, site, dummy):
-        if site in self.otp_inputs:
-            self.otp_inputs[site].setVisible(False)
-        if site in self.send_buttons:
-            self.send_buttons[site].setVisible(False)
+            res_text = f"오출금 (부족: {format_money(abs(result))})"
+            color = "red"
+        self.withdraw_left_fields["정산 결과"].set(res_text)
+        self.withdraw_left_entries["정산 결과"].configure(fg=color)
+    
+    def update_clock(self):
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.status_label.configure(text=now)
+        self.after(1000, self.update_clock)
+    
+    def copy_screenshot(self):
+        try:
+            x = self.winfo_rootx()
+            y = self.winfo_rooty()
+            w = self.winfo_width()
+            h = self.winfo_height()
+            bbox = (x, y, x + w, y + h)
+            img = ImageGrab.grab(bbox)
+            output = io.BytesIO()
+            img.convert("RGB").save(output, "BMP")
+            data = output.getvalue()[14:]
+            output.close()
+            import win32clipboard, win32con
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32con.CF_DIB, data)
+            win32clipboard.CloseClipboard()
+            print("스크린샷이 클립보드에 복사되었습니다.")
+        except Exception as e:
+            print("스크린샷 복사 오류:", e)
+    
+    def copy_text_info(self):
+        info_lines = []
+        info_lines.append("=== 입금 정산 ===")
+        for key in ["B.C", "합계", "정산 결과", "입금 후 미신청", "증복 승인", "전일 금액"]:
+            value = self.left_fields.get(key, tk.StringVar()).get()
+            info_lines.append(f"{key}: {value}")
+        for key in ["VECT PAY", "WING PAY", "GOLD PAY 잔액", "GOLD PAY 출금", "LVL 장"]:
+            value = self.right_fields.get(key, tk.StringVar()).get()
+            info_lines.append(f"{key}: {value}")
+        info_lines.append("")
+        info_lines.append("=== 출금 정산 ===")
+        for key in ["B.C 출금", "출금 합계", "정산 결과"]:
+            value = self.withdraw_left_fields.get(key, tk.StringVar()).get()
+            info_lines.append(f"{key}: {value}")
+        for key in ["환정장 출금", "VECT PAY 출금", "뒷장", "일일 한도", "잔여 한도"]:
+            value = self.withdraw_right_fields.get(key, tk.StringVar()).get()
+            info_lines.append(f"{key}: {value}")
+        settlement_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        info_lines.append("")
+        info_lines.append("정산 시간: " + settlement_time)
+        info_text = "\n".join(info_lines)
+        self.clipboard_clear()
+        self.clipboard_append(info_text)
+        print("정보가 텍스트로 클립보드에 복사되었습니다.")
 
-##############################################
-# MainWindow
-##############################################
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("실시간 정산 시스템")
-        self.resize(400,300)
-        self.stacked_widget = QStackedWidget()
-        self.setCentralWidget(self.stacked_widget)
-        self.login_widget = LoginWidget()
-        self.login_widget.login_success.connect(self.on_login_success)
-        self.stacked_widget.addWidget(self.login_widget)
-    def on_login_success(self, login_id):
-        self.main_interface = MainInterfaceWidget(login_id)
-        self.stacked_widget.addWidget(self.main_interface)
-        self.stacked_widget.setCurrentWidget(self.main_interface)
-    def closeEvent(self, event):
-        event.accept()
-
-##############################################
-# 종료 처리 함수
-##############################################
-def cleanup():
-    print("프로그램 종료, 모든 브라우저 종료")
-atexit.register(cleanup)
-
-##############################################
-# 메인 함수
-##############################################
-def main():
-    app = QApplication(sys.argv)
-    app.setStyleSheet("""
-* { font-family: 'Malgun Gothic', sans-serif; }
-QWidget { background-color: #F0F0F0; color: #333333; }
-QGroupBox { background-color: #FFFFFF; border: none; }
-QLineEdit { background-color: black; border: none; border-radius: 5px; padding: 6px; font-size: 11pt; color: white; }
-QPushButton { background-color: #E0E0E0; border: none; border-radius: 5px; padding: 8px 16px; font-size: 9pt; color: #333333; }
-QPushButton:hover { background-color: #D0D0D0; }
-""")
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
+class ModernStyle(ttk.Style):
+    def __init__(self, root):
+        super().__init__(root)
+        self.theme_use('clam')
+        self.configure("TFrame", background="#2E2E2E")
+        self.configure("TLabel", background="#2E2E2E", foreground="#E0E0E0", font=("Segoe UI", 12))
+        self.configure("TButton", background="#424242", foreground="#E0E0E0", font=("Segoe UI", 10), borderwidth=0)
+        self.map("TButton", background=[("active", "#616161")])
+        self.configure("Start.TButton", foreground="red", font=("Segoe UI", 10))
+        self.map("Start.TButton", foreground=[("active", "red")])
+        self.configure("Stop.TButton", foreground="lime", font=("Segoe UI", 10))
+        self.map("Stop.TButton", foreground=[("active", "lime")])
 
 if __name__ == "__main__":
-    main()
+    app = SettlementCrawlerApp()
+    app.mainloop()
